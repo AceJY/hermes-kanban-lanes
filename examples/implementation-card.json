@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "card_kind": "implementation",
+  "lineage": "example-implementation",
+  "closure_for": null,
+  "executor": "claude",
+  "repository": "primary",
+  "allow": ["src/", "tests/"],
+  "commands": [
+    {
+      "argv": ["python3", "-m", "pytest", "tests", "-q"],
+      "cwd": "."
+    }
+  ],
+  "risk": "normal"
+}

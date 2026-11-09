@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "hermes_source": "/absolute/path/to/hermes-agent",
+  "hermes_commit": "0123456789abcdef0123456789abcdef01234567",
+  "boards": {
+    "engineering": "/absolute/path/to/kanban/engineering.db"
+  },
+  "repositories": {
+    "primary": {
+      "path": "/absolute/path/to/repository",
+      "trusted": true
+    }
+  },
+  "executors": {
+    "claude": {"argv": ["claude"]},
+    "codex": {"argv": ["codex"]}
+  },
+  "work_root": "/absolute/path/to/work",
+  "max_concurrent": 2,
+  "service": {
+    "platform": "launchd",
+    "label": "com.hermes-kanban-lanes.daemon",
+    "log_root": "/absolute/path/to/work/logs",
+    "restart": "on-failure"
+  },
+  "logging": {
+    "retention_days": 14,
+    "max_total_bytes": 2147483648,
+    "max_log_bytes": 10485760,
+    "backups": 3,
+    "keep_failed_runs": 10
+  }
+}
