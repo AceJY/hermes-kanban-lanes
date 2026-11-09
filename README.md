@@ -2,6 +2,7 @@
 
 **English** · [中文](README.zh-CN.md)
 
+[![CI](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml/badge.svg)](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml)
 
 Hermes Kanban Lanes is a fail-closed command-line tool for operating a Hermes
 Kanban lane. Its subcommands validate configuration and cards (`validate-config`,

@@ -2,6 +2,7 @@
 
 [English](README.md) · **中文**
 
+[![CI](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml/badge.svg)](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml)
 
 Hermes Kanban Lanes 是一个 fail-closed 的命令行工具，用于操作一条 Hermes
 Kanban 车道。它的子命令可以校验配置与卡片（`validate-config`、`validate-card`）、
