@@ -221,6 +221,10 @@ def test_workspace_deleted_only_when_termination_is_proven(tmp_path, monkeypatch
         return (pid == 111, {"pid": pid})
 
     monkeypatch.setattr(retention, "prove_terminated", fake_prove)
+    # CI runners have real processes at low PIDs (111/222), which would make the
+    # run look alive and protect it from pruning. Pin liveness to False so the
+    # test exercises retention, not the runner's PID table.
+    monkeypatch.setattr(retention, "pid_alive", lambda pid: False)
 
     report = retention.prune_runs(
         tmp_path, _logging_config(keep_failed_runs=0), now=NOW
