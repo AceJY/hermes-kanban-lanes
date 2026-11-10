@@ -257,6 +257,7 @@ def test_workspace_outside_the_lane_tree_is_never_deleted(tmp_path, monkeypatch)
     monkeypatch.setattr(
         retention, "prove_terminated", lambda *args, **kwargs: (True, {})
     )
+    monkeypatch.setattr(retention, "pid_alive", lambda pid: False)
 
     report = retention.prune_runs(
         tmp_path, _logging_config(keep_failed_runs=0), now=NOW
