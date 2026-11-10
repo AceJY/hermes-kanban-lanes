@@ -19,7 +19,7 @@ from ..card_contract import CardSpec
 from ..config import LaneConfig
 from ..contracts import RunIdentity
 from ..hermes_adapter.board import BoardAdapter
-from ..verification.evidence import sha256_file
+from ..verification.evidence import INDEX_RELATIVE_PATH, sha256_file
 from ..workspace.git import GitError, abort_merge, repo_head, run_git
 from ..release.binding import evaluate_binding
 from ..release.gate import RELEASE_REQUIREMENT_ID, release_preflight
@@ -74,13 +74,39 @@ def _card_path(work_root: str | os.PathLike[str], task_id: str) -> Path:
 def _load_card(
     work_root: str | os.PathLike[str], config: LaneConfig, task_id: str
 ) -> tuple[dict[str, Any] | None, CardSpec | None]:
-    document = _read_json(_card_path(work_root, task_id))
-    if not isinstance(document, dict):
+    """Load a dev task's card, preferring its explicit JSON declaration.
+
+    Hermes-native development cards never write ``cards/<task_id>.json``: the
+    durable record of the declaration they used is the ``card`` snapshot on
+    their own runs.  A present explicit file stays authoritative (and fails
+    closed when malformed) so a stale run can never override it.  Otherwise
+    the newest run of *this* task is read; its snapshot must validate and be
+    an ``implementation`` card, else the caller fails closed.
+
+    The first element tells the caller which failure occurred: ``None`` means
+    no card and no run at all, while a dict means a declaration was found but
+    was unusable.
+    """
+
+    path = _card_path(work_root, task_id)
+    if path.is_file():
+        document = _read_json(path)
+        if not isinstance(document, dict):
+            return {}, None
+        try:
+            return document, CardSpec.from_dict(document, config)
+        except Exception:
+            return document, None
+
+    run_dir, run_document = _latest_dev_run(work_root, task_id)
+    if run_dir is None:
         return None, None
-    try:
-        return document, CardSpec.from_dict(document, config)
-    except Exception:
-        return document, None
+    if not isinstance(run_document, dict):
+        return {}, None
+    candidate = _snapshot_card(run_document.get("card"), config)
+    if candidate is None:
+        return run_document, None
+    return candidate
 
 
 def _snapshot_card(
@@ -104,6 +130,58 @@ def _run_snapshot_key(run_dir: Path, document: dict[str, Any]) -> int:
     if isinstance(identity, dict) and isinstance(identity.get("run_id"), int):
         return int(identity["run_id"])
     return -1
+
+
+def _run_recency_key(
+    run_dir: Path, document: dict[str, Any] | None
+) -> tuple[int, int, str]:
+    """Order a run directory: recorded run id, then finish/start time, then name.
+
+    ``run.json`` may be absent or unreadable; the directory name still starts
+    with the run id (``<run_id>-<token>``), so the latest run can be selected
+    and then failed closed instead of silently falling back to an older run.
+    """
+
+    identity = document.get("identity") if isinstance(document, dict) else None
+    run_id = identity.get("run_id") if isinstance(identity, dict) else None
+    if not isinstance(run_id, int):
+        prefix = run_dir.name.split("-", 1)[0]
+        run_id = int(prefix) if prefix.isdigit() else -1
+    timestamp = -1
+    if isinstance(document, dict):
+        for field in ("finished_at", "started_at"):
+            value = document.get(field)
+            if isinstance(value, int):
+                timestamp = max(timestamp, value)
+    return int(run_id), timestamp, run_dir.name
+
+
+def _latest_dev_run(
+    work_root: str | os.PathLike[str], task_id: str
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """The newest run directory belonging to ``task_id`` and its run document.
+
+    Only ``runs/<task_id>/`` is inspected: a merge card's own runs, or another
+    task's snapshots, can never be borrowed for a development card.  The
+    returned document is ``None`` when that newest run's ``run.json`` is
+    unreadable, which the caller reports as an invalid card.
+    """
+
+    runs_root = Path(work_root) / "runs" / task_id
+    if not runs_root.is_dir():
+        return None, None
+    best: tuple[tuple[int, int, str], Path, dict[str, Any] | None] | None = None
+    for run_dir in runs_root.iterdir():
+        if not run_dir.is_dir():
+            continue
+        document = _read_json(run_dir / "run.json")
+        run_document = document if isinstance(document, dict) else None
+        key = _run_recency_key(run_dir, run_document)
+        if best is None or key > best[0]:
+            best = (key, run_dir, run_document)
+    if best is None:
+        return None, None
+    return best[1], best[2]
 
 
 def _dev_cards(work_root: str | os.PathLike[str], config: LaneConfig) -> list[tuple[str, dict[str, Any], CardSpec]]:
@@ -213,6 +291,341 @@ def _previous_dev_code_commit(
 
 
 # ---------------------------------------------------------------------------
+# 1a. normalise native review metadata (shared by observe and queue)
+# ---------------------------------------------------------------------------
+
+# Hermes-native reviewer cards do not write HKL's D1 metadata document: they
+# record ``review_outcome`` (and the facts they checked) instead of
+# ``verdict``/``dev_run_id``/``evidence_index_sha256``.  These mappings are the
+# only translation; everything else is read from the development run index and
+# the run's own evidence, and the binding below still re-verifies every fact.
+_REVIEW_OUTCOME_VERDICTS = {
+    "approved": "pass",
+    "revise": "revise",
+    "rejected": "revise",
+    "failed": "revise",
+}
+
+INCOMPLETE_REVIEW_METADATA = "review-metadata-incomplete"
+
+
+def _document_run_id(
+    run_dir: Path, document: Mapping[str, Any]
+) -> int | None:
+    """The run id recorded on ``run.json``, falling back to its dir prefix."""
+
+    identity = document.get("identity")
+    if isinstance(identity, Mapping):
+        run_id = identity.get("run_id")
+        if isinstance(run_id, int) and not isinstance(run_id, bool):
+            return run_id
+    prefix = run_dir.name.split("-", 1)[0]
+    return int(prefix) if prefix.isdigit() else None
+
+
+def _runs_matching_head(
+    work_root: str | os.PathLike[str], task_id: str, reviewed_head: Any
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Runs of ``task_id`` whose ``code_commit`` is exactly ``reviewed_head``.
+
+    The index is only ``runs/<task_id>/*/run.json``; another task or a merge
+    card's runs can never be borrowed.  Unreadable documents are skipped
+    rather than guessed.
+    """
+
+    if not isinstance(reviewed_head, str) or not reviewed_head:
+        return []
+    runs_root = Path(work_root) / "runs" / task_id
+    if not runs_root.is_dir():
+        return []
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for run_dir in sorted(runs_root.iterdir(), key=lambda item: item.name):
+        if not run_dir.is_dir():
+            continue
+        document = _read_json(run_dir / "run.json")
+        if not isinstance(document, dict):
+            continue
+        if document.get("code_commit") != reviewed_head:
+            continue
+        if _document_run_id(run_dir, document) is None:
+            continue
+        matches.append((run_dir, document))
+    return matches
+
+
+def _reviewed_tree_for(
+    head: Any,
+    dev_run_dir: Path | None,
+    dev_document: Mapping[str, Any] | None,
+    config: LaneConfig | None,
+) -> str | None:
+    """The git tree of ``head``, read from the run workspace (never guessed).
+
+    ``reviewed_tree`` is a pure function of ``reviewed_head``; deriving it
+    here only fills a structural key.  The binding recomputes the same tree
+    and still rejects a head that is not the tip.
+    """
+
+    if (
+        not isinstance(head, str)
+        or len(head) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in head)
+    ):
+        return None
+    candidates: list[Path] = []
+    if isinstance(dev_document, Mapping):
+        workspace = dev_document.get("workspace")
+        if isinstance(workspace, str) and workspace:
+            candidates.append(Path(workspace))
+    if config is not None:
+        card = dev_document.get("card") if isinstance(dev_document, Mapping) else None
+        repository = card.get("repository") if isinstance(card, Mapping) else None
+        repositories = config.repositories
+        if isinstance(repository, str) and repository in repositories:
+            candidates.append(Path(repositories[repository].path))
+        elif len(repositories) == 1:
+            candidates.append(Path(next(iter(repositories.values())).path))
+    if dev_run_dir is not None:
+        candidates.append(dev_run_dir)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen or not candidate.is_dir():
+            continue
+        seen.add(key)
+        try:
+            result = run_git(
+                ["rev-parse", f"{head}^{{tree}}"], cwd=candidate, timeout=30
+            )
+        except GitError:
+            continue
+        if result.returncode != 0:
+            continue
+        value = result.stdout.strip()
+        if value:
+            return value
+    return None
+
+
+def _review_release_metadata(
+    work_root: str | os.PathLike[str],
+    task_id: str,
+    review_run: Mapping[str, Any],
+    *,
+    config: LaneConfig | None = None,
+    requirement_id: str | None = None,
+) -> dict[str, Any]:
+    """Derive the release fields from one review run's metadata.
+
+    Native metadata is normalised first, then completed from the development
+    run index: a unique run with ``code_commit == reviewed_head`` supplies
+    ``dev_run_id``, and its ``evidence/index.json`` supplies the digest.  A
+    value that cannot be derived unambiguously is never guessed -- the result
+    carries a ``problem``/``reason`` so the caller can record a visible skip.
+    """
+
+    raw_metadata = review_run.get("metadata")
+    raw = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+
+    try:
+        run_id = int(review_run.get("id") or 0)
+    except (TypeError, ValueError):
+        run_id = 0
+
+    # Reviewer cards have drifted between two spellings of the same fact.
+    # ``reviewed_head`` wins; ``reviewed_commit`` is accepted as its alias.
+    # Two present-but-different values are a contradiction: fail closed
+    # instead of choosing one.
+    has_head = "reviewed_head" in raw
+    has_commit = "reviewed_commit" in raw
+    head_conflict = (
+        has_head
+        and has_commit
+        and raw.get("reviewed_head") != raw.get("reviewed_commit")
+    )
+    if head_conflict:
+        reviewed_head = None
+    elif has_head:
+        reviewed_head = raw.get("reviewed_head")
+    else:
+        reviewed_head = raw.get("reviewed_commit")
+
+    reviewer = raw.get("reviewer")
+    review_outcome = raw.get("review_outcome")
+
+    verdict = raw.get("verdict")
+    if not isinstance(verdict, str) or not verdict:
+        outcome = (
+            review_outcome.strip().lower()
+            if isinstance(review_outcome, str)
+            else ""
+        )
+        verdict = _REVIEW_OUTCOME_VERDICTS.get(outcome)
+
+    problem: str | None = None
+    if head_conflict:
+        problem = "reviewed-head-conflict"
+    elif verdict is None:
+        problem = "verdict"
+
+    dev_run_id = raw.get("dev_run_id")
+    usable_dev_run_id = (
+        isinstance(dev_run_id, int)
+        and not isinstance(dev_run_id, bool)
+        and dev_run_id > 0
+    )
+    if usable_dev_run_id:
+        dev_run_dir, dev_document = _find_dev_run(
+            work_root, task_id, int(dev_run_id)
+        )
+    else:
+        dev_run_id = None
+        matches = _runs_matching_head(work_root, task_id, reviewed_head)
+        if len(matches) == 1:
+            dev_run_dir, dev_document = matches[0]
+            dev_run_id = _document_run_id(dev_run_dir, dev_document)
+            if dev_run_id is None:
+                dev_run_dir, dev_document = None, None
+                problem = problem or "dev-run-not-found"
+        elif len(matches) > 1:
+            dev_run_dir, dev_document = None, None
+            problem = problem or "dev-run-ambiguous"
+        else:
+            dev_run_dir, dev_document = None, None
+            problem = problem or "dev-run-not-found"
+
+    evidence_sha = raw.get("evidence_index_sha256")
+    if not isinstance(evidence_sha, str) or not evidence_sha:
+        evidence_sha = None
+        if dev_run_dir is None:
+            problem = problem or "dev-run-not-found"
+        else:
+            try:
+                evidence_sha = sha256_file(dev_run_dir / INDEX_RELATIVE_PATH)
+            except OSError:
+                problem = problem or "evidence-index-missing"
+
+    reviewed_tree = raw.get("reviewed_tree")
+    if not isinstance(reviewed_tree, str) or not reviewed_tree:
+        reviewed_tree = _reviewed_tree_for(
+            reviewed_head, dev_run_dir, dev_document, config
+        )
+
+    rework_round = raw.get("rework_round")
+    if not isinstance(rework_round, int) or isinstance(rework_round, bool):
+        rework_round = raw.get("review_round")
+        if not isinstance(rework_round, int) or isinstance(rework_round, bool):
+            candidate = (
+                dev_document.get("round")
+                if isinstance(dev_document, Mapping)
+                else None
+            )
+            rework_round = (
+                candidate
+                if isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                else None
+            )
+
+    normalised_run_id = raw.get("review_run_id")
+    if (
+        not isinstance(normalised_run_id, int)
+        or isinstance(normalised_run_id, bool)
+        or normalised_run_id <= 0
+    ):
+        normalised_run_id = run_id if run_id > 0 else None
+
+    schema_version = raw.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        schema_version = 1
+
+    normalised_requirement = raw.get("requirement_id")
+    if not isinstance(normalised_requirement, str) or not normalised_requirement:
+        normalised_requirement = requirement_id
+
+    # Keep every original key for audit, then fill the D1 fields the binding
+    # re-verifies.  Nothing here weakens a check: the binding still recomputes
+    # the head, tree, index digest and dev-run identity.
+    normalised = dict(raw)
+    normalised.update(
+        {
+            "schema_version": schema_version,
+            "requirement_id": normalised_requirement,
+            "verdict": verdict,
+            "reviewed_tree": reviewed_tree,
+            "dev_run_id": dev_run_id,
+            "rework_round": rework_round,
+            "reviewer": reviewer,
+            "review_run_id": normalised_run_id,
+            "evidence_index_sha256": evidence_sha,
+        }
+    )
+    if not head_conflict:
+        # Fill the canonical key (or accept the alias); on a contradiction the
+        # original ``reviewed_head`` stays untouched for audit.
+        normalised["reviewed_head"] = reviewed_head
+    normalised.setdefault("reasons", [])
+
+    reason = f"{INCOMPLETE_REVIEW_METADATA}:{problem}" if problem else None
+    return {
+        "verdict": verdict,
+        "dev_run_id": dev_run_id,
+        "evidence_index_sha256": evidence_sha,
+        "reviewed_head": reviewed_head,
+        "reviewer": reviewer,
+        "review_outcome": review_outcome,
+        "reviewed_tree": reviewed_tree,
+        "rework_round": rework_round,
+        "review_run_id": normalised_run_id,
+        "problem": problem,
+        "reason": reason,
+        "metadata": normalised,
+        "dev_run_dir": str(dev_run_dir) if dev_run_dir is not None else None,
+    }
+
+
+def _normalise_review_runs(
+    work_root: str | os.PathLike[str],
+    task_id: str,
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    config: LaneConfig | None = None,
+    requirement_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Copies of ``runs`` whose review metadata is normalised for binding.
+
+    ``evaluate_binding`` selects the newest review run from this sequence; it
+    must see the derived fields while every original key is preserved.
+    """
+
+    normalised_runs: list[dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, Mapping):
+            normalised_runs.append(run)  # type: ignore[arg-type]
+            continue
+        metadata = run.get("metadata")
+        if not isinstance(metadata, Mapping) or (
+            "reviewed_head" not in metadata
+            and "reviewed_commit" not in metadata
+            and "verdict" not in metadata
+        ):
+            normalised_runs.append(dict(run))
+            continue
+        normalised = _review_release_metadata(
+            work_root,
+            task_id,
+            run,
+            config=config,
+            requirement_id=requirement_id,
+        )
+        copy = dict(run)
+        copy["metadata"] = normalised["metadata"]
+        normalised_runs.append(copy)
+    return normalised_runs
+
+
+# ---------------------------------------------------------------------------
 # 1. observe reviews (read-only)
 # ---------------------------------------------------------------------------
 
@@ -250,14 +663,24 @@ def observe_reviews(
             review_run_id = int(run.get("id") or 0)
             if review_run_id in seen:
                 continue
-            metadata = run.get("metadata") or {}
+            normalised = _review_release_metadata(
+                root,
+                task_id,
+                run,
+                config=config,
+                requirement_id=requirement_id,
+            )
             entry = {
                 "review_run_id": review_run_id,
-                "dev_run_id": metadata.get("dev_run_id"),
-                "verdict": metadata.get("verdict"),
-                "reviewed_head": metadata.get("reviewed_head"),
-                "evidence_index_sha256": metadata.get("evidence_index_sha256"),
-                "reviewer": metadata.get("reviewer"),
+                "dev_run_id": normalised["dev_run_id"],
+                "verdict": normalised["verdict"],
+                "reviewed_head": normalised["reviewed_head"],
+                "evidence_index_sha256": normalised["evidence_index_sha256"],
+                "reviewer": normalised["reviewer"],
+                # Keep the native keys in the ledger for audit.
+                "review_outcome": normalised["review_outcome"],
+                "review_metadata_problem": normalised["problem"],
+                "review_metadata_reason": normalised["reason"],
             }
             ledger.setdefault("reviews", []).append(entry)
             observed.append(dict(entry, task_id=task_id))
@@ -340,10 +763,62 @@ def queue_release_cards(
         if not reviews:
             continue
         latest = max(reviews, key=lambda run: int(run.get("id") or 0))
-        metadata = latest.get("metadata") or {}
-        dev_run_id = metadata.get("dev_run_id")
+        raw_metadata = latest.get("metadata")
+        raw_metadata = (
+            raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        )
+        if (
+            "reviewed_head" in raw_metadata
+            or "reviewed_commit" in raw_metadata
+            or "verdict" in raw_metadata
+        ):
+            normalised = _review_release_metadata(
+                root,
+                task_id,
+                latest,
+                config=config,
+                requirement_id=requirement_id,
+            )
+            if normalised["problem"] is not None:
+                # Never guess: the missing field is visible in the queue report.
+                queued.append(
+                    _snapshot_skip(
+                        task_id, INCOMPLETE_REVIEW_METADATA, normalised["problem"]
+                    )
+                )
+                continue
+            if normalised["verdict"] != "pass":
+                continue
+            dev_run_id = normalised["dev_run_id"]
+        else:
+            # Not a review metadata document (a partial row the old code also
+            # never treated as one): keep the previous shape check untouched.
+            dev_run_id = raw_metadata.get("dev_run_id")
         if not isinstance(dev_run_id, int):
             continue
+
+        # The binding must re-verify the same derived facts.  Normalise every
+        # review run in the sequence it selects from, without touching the
+        # dev run rows.
+        evaluation_runs = list(runs)
+        known_ids = {
+            int(run.get("id") or 0)
+            for run in runs
+            if isinstance(run, Mapping)
+        }
+        for review in reviews:
+            if not isinstance(review, Mapping):
+                continue
+            if int(review.get("id") or 0) not in known_ids:
+                evaluation_runs.append(review)
+        evaluation_runs = _normalise_review_runs(
+            root,
+            task_id,
+            evaluation_runs,
+            config=config,
+            requirement_id=requirement_id,
+        )
+
         explicit_card = _card_path(root, task_id).is_file()
         dev_dir, dev_document = _find_dev_run(root, task_id, dev_run_id)
         if explicit_card:
@@ -395,7 +870,7 @@ def queue_release_cards(
                 continue
         evaluation = evaluate_binding(
             task_row=row,
-            runs=runs,
+            runs=evaluation_runs,
             dev_run_dir=dev_dir,
             repo=config.repositories[dev_card.repository].path,
             requirement_id=requirement_id,
@@ -573,7 +1048,7 @@ def release_once(
 
     dev_document, dev_card = _load_card(root, config, dev_task_id)
     if dev_card is None:
-        reason = "dev-card-missing"
+        reason = "dev-card-invalid" if isinstance(dev_document, dict) else "dev-card-missing"
         _terminal_state(state, run_dir)
         outcome.update(action="block", reason=reason)
         outcome["terminal_ok"] = _blocked(adapter, identity, reason, "capability")

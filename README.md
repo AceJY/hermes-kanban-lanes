@@ -4,14 +4,37 @@
 
 [![CI](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml/badge.svg)](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml)
 
-Hermes Kanban Lanes is a fail-closed command-line tool for operating a Hermes
-Kanban lane. Its subcommands validate configuration and cards (`validate-config`,
-`validate-card`), diagnose one lane (`doctor`), run a single tick or a polling
-daemon (`tick`, `run`), and render or manage the user-level service unit
-(`service`).
+**Run Claude Code, Codex, and DeepSeek Harness as Kanban workers — with a verification gate, reproducible evidence, review/rework routing, and an optional merge loop.**
 
-This is `0.1.0.dev0`. Only the installation forms and platform promises listed
-below are claimed; treat everything else as unverified.
+Hermes Kanban Lanes (HKL) turns a Hermes Kanban board into a control plane for coding agents. A card declares the task and the files it may touch; HKL claims it, creates an isolated git worktree, launches the configured harness (`claude`, `codex`, or `dsh`), runs a five-check gate over the diff, records a reproducible evidence manifest, and moves the card to review, rework, or merge. The board remains the source of truth; the harness only edits code.
+
+```text
+Hermes Kanban board
+        │  card: lane + development contract
+        ▼
+HKL daemon ── claim ──► isolated git worktree
+        │                       │
+        │                       ▼
+        │            Claude Code / Codex / DSH
+        │                       │
+        ▼                       ▼
+   gate 1: scope · tests · build · artifacts
+        │
+        ├─ fail ──► rework card (bounded rounds)
+        └─ pass ──► evidence manifest ──► review ──► merge (optional)
+```
+
+### Supported harnesses
+
+| Harness | Executor key | Notes |
+|---|---|---|
+| **Claude Code** | `claude` | Anthropic's coding CLI; exercised in production. |
+| **Codex** | `codex` | OpenAI Codex CLI; adapter covered by the test suite. |
+| **DeepSeek Harness (DSH)** | `dsh` | DSH headless JSON mode (`dsh --profile headless --json`); exercised in production. |
+
+**Why a lane, not just a prompt:** running the harness is the easy part. HKL adds the parts that decide whether the work is real — file-scope enforcement, the project's own test and build commands, a reproducible evidence manifest, review with bounded rework, merge only from a reviewed head, and a resident service that re-resolves its Python generation after a Hermes upgrade instead of silently dying.
+
+This is `0.2.0`. Only the installation forms and platform promises listed below are claimed; treat everything else as unverified.
 
 ## What this is — and is not
 
@@ -40,7 +63,7 @@ below are claimed; treat everything else as unverified.
 - A Hermes host checkout at the commit named by `hermes_commit`.
 - A Kanban board SQLite database containing a `tasks` table.
 - A trusted git repository for the lane to work in.
-- The executor binaries named in `executors` (`claude` and/or `codex`) on
+- The executor binaries named in `executors` (`claude`, `codex`, and/or `dsh`) on
   `PATH`, or absolute paths to them.
 
 Platform promises:
@@ -58,7 +81,7 @@ The project repository is <https://github.com/AceJY/hermes-kanban-lanes>.
 From a wheel:
 
 ```sh
-python -m pip install /path/to/hermes_kanban_lanes-0.1.0.dev0-py3-none-any.whl
+python -m pip install /path/to/hermes_kanban_lanes-0.2.0-py3-none-any.whl
 ```
 
 From a source checkout:
@@ -74,7 +97,7 @@ Confirm the installed distribution:
 hermes-kanban-lanes --version
 ```
 
-The command prints the installed version (for example `0.1.0.dev0`) and exits
+The command prints the installed version (for example `0.2.0`) and exits
 `0`.
 
 ## Quick start
@@ -150,7 +173,7 @@ be absolute; a leading tilde and environment variables are not expanded.
 | `hermes_commit` | yes | Expected host `HEAD` (40 or 64 hex characters). |
 | `boards` | yes | Object mapping a board alias to an absolute SQLite path. |
 | `repositories` | yes | Object mapping a repository alias to `{"path": "<absolute>", "trusted": true}`. |
-| `executors` | yes | Object with `claude` and/or `codex`, each `{"argv": ["<binary>", ...]}`. |
+| `executors` | yes | Object with `claude`, `codex`, and/or `dsh`, each `{"argv": ["<binary>", ...]}`. |
 | `work_root` | yes | Absolute writable directory for locks, runs, cards, and logs. |
 | `max_concurrent` | yes | Positive integer. |
 | `review` | no | Reviewer name, rework limit, authorization directory, and merge policy. |
@@ -194,7 +217,8 @@ A complete document with every optional block:
   },
   "executors": {
     "claude": {"argv": ["claude"]},
-    "codex": {"argv": ["codex"]}
+    "codex": {"argv": ["codex"]},
+    "dsh": {"argv": ["dsh"]}
   },
   "work_root": "/absolute/path/to/work",
   "max_concurrent": 2,
@@ -225,11 +249,12 @@ unit. It never writes to system-wide service directories.
 
 | Action | Command | Behavior |
 |---|---|---|
-| Render | `service render --platform launchd\|systemd --config PATH --out DIR` | Writes one unit file into `DIR` and nothing else. |
-| Install | `service install --platform … --config PATH [--dry-run]` | Installs and loads the user-level unit. |
+| Render | `service render --platform launchd\|systemd --config PATH --out DIR [--wheel WHEEL]` | Writes one unit file into `DIR`; also stages the generation-independent launcher and wheel under the service metadata directory. |
+| Install | `service install --platform … --config PATH [--dry-run] [--wheel WHEEL]` | Stages the launcher/wheel, installs and loads the user-level unit. |
 | Status | `service status --platform … --config PATH [--dry-run]` | Read-only status of the user-level unit. |
 | Restart | `service restart --platform … --config PATH` | Restarts the installed user-level unit. |
 | Uninstall | `service uninstall --platform … --config PATH [--dry-run]` | Unloads the job and removes the unit file. |
+| Metadata | — | Retained after uninstall for diagnosis: see below. |
 
 - **macOS launchd** is the only claimed lifecycle platform. The unit is a
   user-level plist loaded through `launchctl` in the current user's GUI
@@ -239,11 +264,56 @@ unit. It never writes to system-wide service directories.
   closed with `service-platform-render-only` and never execute `systemctl`.
 - **Windows** is not supported; the lock primitive used by `tick` and `run` is
   unavailable there.
-- The unit uses the launch command bound to the Hermes installation, resolved
-  through the host's `--print-runtime-command`. If that resolution fails, the
-  command fails closed instead of falling back to the current interpreter.
+- **Generation-independent launcher.** The unit does not carry a generation
+  Python path. It starts `runtime-launcher.py` from
+  `$HOME/.hermes/kanban-lanes-service/`; on every start that launcher re-resolves
+  the runtime through the host's `--print-runtime-command`, probes
+  `import hermes_kanban_lanes` plus the distribution version in that exact
+  generation, and only then execs the daemon. Only a generation
+  `site-packages`/`dist-packages` anchored under
+  `HERMES_HOME/installs/*/environments/*/venv` is accepted; resolving to a
+  store/tool Python's purelib fails closed with
+  `generation-unanchored:<path>` and nothing is installed there. The recorded
+  `hermes_home` anchor is the Hermes root: a session profile path
+  `<root>/profiles/<name>` is normalised to `<root>`, and render/install fails
+  with `service-hermes-home-unresolved` when no candidate root owns
+  `installs/`. If the
+  generation is missing the plugin (the normal state after `hermes update`
+  switches generations), or if the staged wheel's sha256 differs from the one
+  last installed into this generation, the launcher installs the staged wheel
+  offline with
+  `pip install --no-index --no-deps --force-reinstall --upgrade --target
+  <generation site-packages>`, falls back to
+  `uv pip install --offline --no-deps --reinstall --python <generation python>
+  --target <generation site-packages>` when pip is unavailable, and re-probes
+  before starting. A failed resolution, missing wheel, failed install or
+  failed re-probe exits non-zero; it never falls back to `sys.executable` or a
+  stale generation.
+- **Service metadata directory** (`$HOME/.hermes/kanban-lanes-service/`):
+  `state.json` (state file written by render/install: `product_version`,
+  `hermes_source`/`hermes_launcher`, the `hermes_home` anchor, `module` and
+  `daemon_argv`, `config_path`, the staged `wheel` and its `wheel_sha256`, the
+  discovered `uv`, and the metadata paths), `runtime-launcher.py` (generated
+  stdlib-only launcher), `wheel/` (copy of the running product wheel),
+  `installed.json` (the last successful install: wheel sha256, timestamp and
+  generation path), `launcher.log` (resolution/probe/install transcript with
+  pip/uv stderr tails, no credentials or environment dumps) and
+  `launch-failure.json` (JSON marker written on any launcher failure: time,
+  runtime path, generation, reason and, for install failures, an
+  `install_error` stderr tail). On a runtime-resolution failure both
+  `runtime` and `generation` are `null`. The wheel is discovered from an
+  explicit `--wheel` path, the `HERMES_KANBAN_LANES_WHEEL`/`HKL_WHEEL`
+  environment variable, the installed distribution's `direct_url.json`, the
+  staged wheel, or the local `dist/` directory; nothing is downloaded.
+- **After every Hermes upgrade** run `hermes kanban-lanes doctor`. The
+  `plugin-runtime` check must PASS for the new generation; a missing or
+  version-mismatched distribution reports FAIL with the exact
+  `service install` command and the current generation path. If the service
+  fails to start, read `$HOME/.hermes/kanban-lanes-service/launch-failure.json`
+  for the failure reason and runtime path, then re-run `service install`.
 - `uninstall` removes only the unit file and unloads the job. It does not
-  delete repositories, run evidence under `work_root`, or Kanban board data.
+  delete repositories, run evidence under `work_root`, Kanban board data, or
+  the service metadata directory.
 
 ## Exit codes
 

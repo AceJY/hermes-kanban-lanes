@@ -63,6 +63,7 @@ from .process import (
     start_fingerprint,
     terminate,
 )
+from .retention import remove_run_tmp
 from .state import RunState, new_state, read_state, write_state
 
 REQUIREMENT_ID = "HKL-W3"
@@ -749,6 +750,23 @@ def run_once(
             if cancelled
             else None
         )
+
+        # W13: the executor has exited (successfully or not), so its pid is
+        # dead.  Leaving it published would let the host's crash sweep reclaim
+        # this still-running card while gate/review finishing is in flight.
+        # Clear only this run, fenced by its run id and claim lock, and do it
+        # before any intents/commit/gate work.  After losing the claim we write
+        # nothing (D2/D6), so the doomed pid stays for the host's own takeover.
+        if not lost:
+            try:
+                adapter.clear_worker(identity)
+            except Exception as exc:  # noqa: BLE001 - adapter boundary
+                # Never continue silently into the gate with a dead pid still
+                # published: record the explicit cause and take the ordinary
+                # environment-failure/block path.
+                category = "environment_failure"
+                failure_reason = f"worker-pid-clear:{type(exc).__name__}"
+
         state.advance("executor_exited")
         write_state(run_dir, state)
 
@@ -1167,6 +1185,18 @@ def run_once(
             except OSError:  # pragma: no cover - marker is best effort here
                 pass
         outcome.cleanup = cleanup
+        # W13: an exception after the executor exited must not leave its dead
+        # pid published either.  Only clear once termination is proven and the
+        # claim still belongs to this run; a failed clear is recorded here and
+        # the ordinary block path below still runs.
+        if child is not None and cleanup.get("terminated", False) and not lost:
+            try:
+                adapter.clear_worker(identity)
+            except Exception as clear_exc:  # noqa: BLE001 - adapter boundary
+                outcome.reason = (
+                    f"{outcome.reason}; worker-pid-clear:"
+                    f"{type(clear_exc).__name__}"
+                )
         try:
             if adapter.identity(identity.task_id) == identity:
                 outcome.terminal_ok = adapter.block(
@@ -1183,6 +1213,10 @@ def run_once(
         outcome.stage = state.stage
 
     # -- run.json ------------------------------------------------------------
+    # W11c: the run is terminal in every path that reaches here (success,
+    # failure, timeout, cancellation or a recorded exception).  Disposable
+    # ``tmp/`` is no longer needed, but run.json/evidence/state stay put.
+    tmp_cleanup_bytes = remove_run_tmp(run_dir)
     finished_at = int(time.time())
     outcome.baseline = dict(baseline)
     outcome.evidence = evidence_document
@@ -1243,6 +1277,10 @@ def run_once(
         "evidence": evidence_document,
         "recovery": {"recovered": False, "stage_before": None, "finalized": False},
         "cleanup": cleanup,
+        "tmp_cleanup": {
+            "path": "tmp",
+            "removed_bytes": tmp_cleanup_bytes,
+        },
         "intents": intents,
         "terminal": {
             "action": outcome.terminal,
@@ -1365,6 +1403,9 @@ def recover_run(
         return {**base, "action": "request-review-not-applied"}
     state.advance("terminal")
     write_state(run_path, state)
+    # The recovered run is terminal too; retention would do this on its next
+    # pass, but the supervisor owns the immediate cleanup.
+    remove_run_tmp(run_path)
     return {**base, "action": "request_review"}
 
 

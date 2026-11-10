@@ -10,10 +10,12 @@ from __future__ import annotations
 from .base import ExecutorAdapter, ExecutorOutcome
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .dsh import DshAdapter
 
 ADAPTERS = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
+    "dsh": DshAdapter,
 }
 
 
@@ -35,6 +37,7 @@ __all__ = [
     "ADAPTERS",
     "ClaudeAdapter",
     "CodexAdapter",
+    "DshAdapter",
     "ExecutorAdapter",
     "ExecutorOutcome",
     "adapter_for",

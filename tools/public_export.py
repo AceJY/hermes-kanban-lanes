@@ -42,6 +42,7 @@ PUBLIC_FILES = (
     "pyproject.toml",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md",
     "CONTRIBUTING.md",

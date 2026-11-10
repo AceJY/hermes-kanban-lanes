@@ -25,6 +25,7 @@ import os
 import platform as platform_module
 import shutil
 import sys
+import sysconfig
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -202,6 +203,14 @@ def _add_commands(parser: argparse.ArgumentParser, *, with_version: bool) -> Non
             action="store_true",
             help="print the installed distribution version and exit",
         )
+        # Internal seam for the generated service launcher: report the version,
+        # distribution metadata and import path of this exact generation.
+        parser.add_argument(
+            "--package-probe",
+            action="store_true",
+            dest="package_probe",
+            help=argparse.SUPPRESS,
+        )
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -282,6 +291,12 @@ def _add_commands(parser: argparse.ArgumentParser, *, with_version: bool) -> Non
         "--config", required=True, dest="config_path"
     )
     render_parser.add_argument("--out", required=True, dest="out_dir")
+    render_parser.add_argument(
+        "--wheel",
+        dest="wheel_path",
+        default=None,
+        help="product wheel to stage for offline service self-healing",
+    )
 
     for action, help_text in (
         ("install", "install and load the user-level unit"),
@@ -301,6 +316,13 @@ def _add_commands(parser: argparse.ArgumentParser, *, with_version: bool) -> Non
             dest="dry_run",
             help="print the commands without writing or running them",
         )
+        if action == "install":
+            action_parser.add_argument(
+                "--wheel",
+                dest="wheel_path",
+                default=None,
+                help="product wheel to stage for offline service self-healing",
+            )
 
     restart_parser = service_sub.add_parser(
         "restart", help="restart an installed user-level unit"
@@ -347,6 +369,148 @@ def _executable_available(executable: str) -> bool:
 
 def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "ok": bool(ok), "detail": detail}
+
+
+def _generation_paths() -> list[str]:
+    """Import roots that belong to the generation currently executing.
+
+    Hermes' bootstrap activates the selected dependency generation by putting
+    its ``site-packages`` on ``sys.path`` (the store interpreter runs with
+    ``-I``, so its own site-packages never appear).  A source checkout used by
+    the test suite has no site-packages entry and is reported separately.
+    """
+
+    roots: list[str] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        candidate = Path(entry)
+        try:
+            if candidate.is_dir() and candidate.name in {
+                "site-packages",
+                "dist-packages",
+            }:
+                roots.append(str(candidate))
+        except OSError:
+            continue
+    if not roots:
+        try:
+            roots.append(sysconfig.get_paths()["purelib"])
+        except (KeyError, OSError):
+            roots.append(sys.prefix or sys.executable)
+    return roots
+
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _source_checkout_root(module_file: str) -> str | None:
+    """The product source tree, when the module was imported from a checkout."""
+
+    path = Path(module_file).resolve()
+    for parent in path.parents:
+        pyproject = parent / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            text = pyproject.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if 'name = "hermes-kanban-lanes"' in text or (
+            "name = 'hermes-kanban-lanes'" in text
+        ):
+            return str(parent)
+    return None
+
+
+def _plugin_runtime_check(
+    config: LaneConfig, config_path: str
+) -> dict[str, Any]:
+    """W14: the product must be importable from this exact generation.
+
+    Unlike ``service-runtime`` this check does not start a process and has no
+    installation side effect: it compares the installed distribution metadata,
+    the package version and the import path of the running process.  A
+    mismatch means the next Hermes generation switch will silently drop the
+    plugin, so the detail carries an exact reinstall command and the
+    generation path.
+    """
+
+    import hermes_kanban_lanes as package
+
+    distribution = _distribution_version()
+    expected = __version__
+    module_file = getattr(package, "__file__", None)
+    roots = _generation_paths()
+    generation = roots[0]
+    platform = config.service_options().platform or "launchd"
+    reinstall = (
+        "hermes-kanban-lanes service install --platform "
+        f"{platform} --config {config_path}"
+    )
+    import_path = str(module_file) if module_file else "missing"
+    suffix = f"; reinstall: {reinstall}; generation={generation}"
+
+    if distribution is None:
+        return _check(
+            "plugin-runtime",
+            False,
+            f"plugin-runtime-dist-missing; import={import_path}{suffix}",
+        )
+    if distribution != expected:
+        return _check(
+            "plugin-runtime",
+            False,
+            "plugin-runtime-version-mismatch; "
+            f"dist={distribution}; expected={expected}; import={import_path}"
+            f"{suffix}",
+        )
+    if not module_file or not os.path.isfile(module_file):
+        return _check(
+            "plugin-runtime",
+            False,
+            f"plugin-runtime-import-missing; import={import_path}{suffix}",
+        )
+    source_root = _source_checkout_root(module_file)
+    if not (
+        any(_is_within(module_file, root) for root in roots)
+        or source_root is not None
+    ):
+        return _check(
+            "plugin-runtime",
+            False,
+            "plugin-runtime-import-outside-generation; "
+            f"import={import_path}{suffix}",
+        )
+    return _check(
+        "plugin-runtime",
+        True,
+        f"dist={distribution} version={expected} import={import_path} "
+        f"generation={generation}",
+    )
+
+
+def _package_probe_payload() -> dict[str, Any]:
+    """One JSON object describing the executing generation (launcher probe)."""
+
+    import hermes_kanban_lanes as package
+
+    distribution = _distribution_version()
+    payload = {
+        "ok": distribution is not None and distribution == __version__,
+        "version": __version__,
+        "dist_version": distribution,
+        "file": getattr(package, "__file__", None),
+        "prefix": sys.prefix,
+        "executable": sys.executable,
+        "site_packages": _generation_paths(),
+    }
+    return payload
 
 
 def _secret_candidates(loaded: Sequence[str]) -> list[str]:
@@ -427,6 +591,9 @@ def _doctor_checks(
         )
     else:
         checks.append(_check("package", True, __version__))
+
+    # -- plugin-runtime --------------------------------------------------
+    checks.append(_plugin_runtime_check(config, config_path))
 
     # -- platform --------------------------------------------------------
     python_version = platform_module.python_version()
@@ -1108,6 +1275,14 @@ def _service_render(args: argparse.Namespace) -> int:
             config_path,
         )
         target = service.render_to(unit, args.out_dir)
+        # Render also stages the generation-independent launcher and the wheel
+        # next to the service metadata, so the rendered unit stays usable after
+        # Hermes switches generations.  --out still receives only the unit.
+        staged = service.stage_service_state(
+            config,
+            config_path,
+            wheel_path=getattr(args, "wheel_path", None),
+        )
     except service.ServiceError as exc:
         _emit_object_error(
             _structured_error(
@@ -1147,6 +1322,8 @@ def _service_render(args: argparse.Namespace) -> int:
             "ok": True,
             "platform": args.platform,
             "unit_path": str(target),
+            "state_path": staged["state_file"],
+            "wheel_path": staged["wheel"],
             "unit": unit.to_dict(),
         }
     )
@@ -1270,7 +1447,11 @@ def _service_action(args: argparse.Namespace) -> int:
     try:
         if action == "install":
             result = service.install_service(
-                args.platform, config, config_path, dry_run=dry_run
+                args.platform,
+                config,
+                config_path,
+                dry_run=dry_run,
+                wheel_path=getattr(args, "wheel_path", None),
             )
             exit_code = EXIT_OK if result["ok"] else EXIT_INVALID
         elif action == "uninstall":
@@ -1437,6 +1618,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if getattr(args, "version", False):
         print(__version__)
+        return EXIT_OK
+
+    if getattr(args, "package_probe", False):
+        _emit_object(_package_probe_payload())
         return EXIT_OK
 
     if getattr(args, "command", None) is None:

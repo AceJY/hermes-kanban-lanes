@@ -30,7 +30,7 @@ from .contracts import (
 )
 
 CARD_KINDS = frozenset({"implementation", "review", "closure", "merge", "gate"})
-EXECUTORS = frozenset({"claude", "codex"})
+EXECUTORS = frozenset({"claude", "codex", "dsh"})
 RISKS = frozenset({"normal", "high"})
 _CLOSURE_REQUIRED = frozenset({"closure", "merge", "gate"})
 _CARD_REQUIRED_KEYS = (

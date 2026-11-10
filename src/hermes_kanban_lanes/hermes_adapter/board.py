@@ -271,6 +271,45 @@ class BoardAdapter:
         )
         return True
 
+    def clear_worker(self, identity: RunIdentity) -> bool:
+        """Withdraw this run's worker pid after its executor has exited.
+
+        The host's ``detect_crashed_workers`` reclaims a ``running`` card whose
+        ``worker_pid`` is dead.  A finished executor's pid is dead by
+        definition, so leaving it published would let the host reclaim the
+        card while the gate/review finishing still owns it.  Only this run is
+        touched: the task update is fenced by run id and claim lock, and the
+        ``task_runs`` mirror update is keyed by the same run id and task but
+        only runs when that fenced task update actually matched.
+
+        Returns ``False`` when the card is no longer this run's claim (nothing
+        was cleared, in either table); database failures raise so the caller
+        can route them through its normal failure path.
+        """
+
+        try:
+            with self._kbc.write_txn(self.connection):
+                cur = self.connection.execute(
+                    "UPDATE tasks SET worker_pid = NULL, worker_started_at = NULL "
+                    "WHERE id = ? AND current_run_id = ? AND claim_lock = ?",
+                    (identity.task_id, identity.run_id, identity.claim_lock),
+                )
+                cleared = cur.rowcount == 1
+                # After losing the claim we write nothing (D2/D6): the doomed
+                # pid stays published for the host's own takeover, and the
+                # task_runs mirror must not diverge from the task row.
+                if cleared:
+                    self.connection.execute(
+                        "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
+                        "WHERE id = ? AND task_id = ?",
+                        (identity.run_id, identity.task_id),
+                    )
+        except Exception as exc:  # host/sqlite exception surface
+            raise BoardAdapterError(
+                f"clear_worker: host call failed ({type(exc).__name__})"
+            ) from None
+        return cleared
+
     # -- side effects ------------------------------------------------------
 
     def apply_intent(
@@ -397,14 +436,49 @@ class BoardAdapter:
         return result
 
     def review_runs(self, task_id: str) -> list[dict[str, Any]]:
-        """Runs carrying a reviewer verdict document (D1 metadata)."""
+        """Runs carrying a reviewer verdict document (D1 metadata).
 
-        return [
-            entry
-            for entry in self.run_rows(task_id)
-            if isinstance(entry.get("metadata"), dict)
-            and "reviewed_head" in entry["metadata"]
-        ]
+        Reviewer cards have drifted between ``reviewed_head`` and
+        ``reviewed_commit`` for the same fact.  Both keys identify the reviewed
+        commit, so either marks a review record and the returned entry always
+        carries a normalised ``reviewed_head`` (the original keys stay for
+        audit).  When both keys are present but disagree nothing is guessed:
+        the entry is flagged as a conflict and the release layer skips it.
+        """
+
+        reviews: list[dict[str, Any]] = []
+        for entry in self.run_rows(task_id):
+            metadata = entry.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            has_head = "reviewed_head" in metadata
+            has_commit = "reviewed_commit" in metadata
+            if not has_head and not has_commit:
+                continue
+            if (
+                has_head
+                and has_commit
+                and metadata["reviewed_head"] != metadata["reviewed_commit"]
+            ):
+                # Fail closed: never pick one spelling over the other.
+                entry["reviewed_head"] = None
+                entry["reviewed_head_conflict"] = {
+                    "reviewed_head": metadata["reviewed_head"],
+                    "reviewed_commit": metadata["reviewed_commit"],
+                }
+                reviews.append(entry)
+                continue
+            reviewed_head = (
+                metadata["reviewed_head"] if has_head else metadata["reviewed_commit"]
+            )
+            entry["reviewed_head"] = reviewed_head
+            if not has_head:
+                # Add the normalised key without overwriting ``reviewed_commit``.
+                normalised = dict(metadata)
+                normalised["reviewed_head"] = reviewed_head
+                entry["metadata"] = normalised
+            reviews.append(entry)
+        return reviews
 
     def changes_requested_events(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(

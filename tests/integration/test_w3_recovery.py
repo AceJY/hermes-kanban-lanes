@@ -511,7 +511,27 @@ def test_daemon_tick_recovers_evidence_before_any_stale_sweep(
     worker_pid = board.connection.execute(
         "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()[0]
-    assert worker_pid and not pid_alive(int(worker_pid))
+    # W13: the executor pid is withdrawn after the executor exits and before
+    # the gate, so a supervisor crashing at the evidence stage leaves no dead
+    # pid behind.  The W3 crash window (supervisor dies while the executor is
+    # still running, i.e. before the clear) is modelled for ``dead-worker`` by
+    # re-publishing a dead pid, so this tick still has to prove that evidence
+    # recovery runs before any stale sweep.
+    assert worker_pid is None
+    if stale_kind == "dead-worker":
+        dead_worker_pid = _dead_pid()
+        with board.connection:
+            board.connection.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = NULL "
+                "WHERE id = ?",
+                (dead_worker_pid, task_id),
+            )
+            board.connection.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = NULL "
+                "WHERE id = ? AND task_id = ?",
+                (dead_worker_pid, identity.run_id, task_id),
+            )
+        assert not pid_alive(dead_worker_pid)
 
     now = int(time.time())
     with board.connection:

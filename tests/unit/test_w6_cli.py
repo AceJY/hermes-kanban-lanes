@@ -568,6 +568,13 @@ def test_service_oserror_exits_two(tmp_path, monkeypatch, capsys):
 def test_service_render_requires_absolute_config(tmp_path, monkeypatch, capsys):
     config_path = _write_config(tmp_path)
     _write_fake_launcher(tmp_path)
+    # Render stages the runtime launcher and state under $HOME/.hermes: keep
+    # the real user's service metadata out of the test's write path.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".hermes" / "installs").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.chdir(tmp_path)
     relative = Path(config_path).name
     assert (

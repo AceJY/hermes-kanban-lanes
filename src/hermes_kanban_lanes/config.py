@@ -43,7 +43,7 @@ _OPTIONAL_CONFIG_KEYS = ("review", "service", "logging")
 _REQUIRED_CONFIG_KEYS = tuple(
     key for key in CONFIG_KEYS if key not in _OPTIONAL_CONFIG_KEYS
 )
-_ALLOWED_EXECUTORS = frozenset({"claude", "codex"})
+_ALLOWED_EXECUTORS = frozenset({"claude", "codex", "dsh"})
 REVIEW_KEYS = (
     "reviewer",
     "max_rework_rounds",
@@ -473,7 +473,7 @@ class LaneConfig:
         for alias, executor in executors.items():
             if alias not in _ALLOWED_EXECUTORS:
                 raise ContractError(
-                    "LaneConfig.executors: keys must be one of claude, codex"
+                    "LaneConfig.executors: keys must be one of claude, codex, dsh"
                 )
             if not isinstance(executor, Executor):
                 raise ContractError(
@@ -531,7 +531,7 @@ class LaneConfig:
         for alias, value in executors_raw.items():
             if alias not in _ALLOWED_EXECUTORS:
                 raise ContractError(
-                    f"{field}.executors: keys must be one of claude, codex"
+                    f"{field}.executors: keys must be one of claude, codex, dsh"
                 )
             base = f"{field}.executors.{alias}"
             entry = _expect_mapping(value, base)

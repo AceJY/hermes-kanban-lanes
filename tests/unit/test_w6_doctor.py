@@ -114,6 +114,7 @@ def test_doctor_all_ok(tmp_path, doctor_env, make_config, board, make_repo, fake
     assert report["ok"] is True
     assert [check["name"] for check in report["checks"]] == [
         "package",
+        "plugin-runtime",
         "platform",
         "host-hermes",
         "board:test",
@@ -336,6 +337,75 @@ def test_doctor_package_metadata_missing(monkeypatch, tmp_path, doctor_env, make
     checks = _checks(report)
     assert checks["package"]["ok"] is False
     assert "package-metadata-missing" in checks["package"]["detail"]
+
+
+def test_plugin_runtime_check_passes_in_current_generation(
+    tmp_path, doctor_env, make_config, board, make_repo, fake_executor
+):
+    """W14: a matching distribution and import path PASS with no side effect."""
+
+    repo = make_repo()
+    config = _config(tmp_path, make_config, board, repo, fake_executor)
+    report = cli.doctor_report(config, str(tmp_path / "config.json"))
+    check = _checks(report)["plugin-runtime"]
+    assert check["ok"] is True
+    assert f"dist={__version__}" in check["detail"]
+    assert "import=" in check["detail"]
+    assert "generation=" in check["detail"]
+    # doctor must not stage, install or otherwise touch the service state.
+    assert not (doctor_env / ".hermes" / "kanban-lanes-service").exists()
+
+
+def test_plugin_runtime_check_fails_when_missing(
+    monkeypatch, tmp_path, doctor_env, make_config, board, make_repo, fake_executor
+):
+    """A generation that cannot resolve the distribution exits doctor FAIL."""
+
+    monkeypatch.setattr(cli, "_distribution_version", lambda: None)
+    repo = make_repo()
+    config = _config(tmp_path, make_config, board, repo, fake_executor)
+    report = cli.doctor_report(config, str(tmp_path / "config.json"))
+    check = _checks(report)["plugin-runtime"]
+    assert check["ok"] is False
+    assert "plugin-runtime-dist-missing" in check["detail"]
+    assert "service install --platform" in check["detail"]
+    assert "generation=" in check["detail"]
+
+
+def test_plugin_runtime_check_fails_on_version_mismatch(
+    monkeypatch, tmp_path, doctor_env, make_config, board, make_repo, fake_executor
+):
+    """A stale distribution in the current generation is a hard failure."""
+
+    monkeypatch.setattr(cli, "_distribution_version", lambda: "9.9.9")
+    repo = make_repo()
+    config = _config(tmp_path, make_config, board, repo, fake_executor)
+    report = cli.doctor_report(config, str(tmp_path / "config.json"))
+    check = _checks(report)["plugin-runtime"]
+    assert check["ok"] is False
+    assert "plugin-runtime-version-mismatch" in check["detail"]
+    assert "dist=9.9.9" in check["detail"]
+    assert "service install --platform" in check["detail"]
+
+
+def test_plugin_runtime_check_fails_outside_generation(
+    monkeypatch, tmp_path, doctor_env, make_config, board, make_repo, fake_executor
+):
+    """An install whose import path is neither site-packages nor a checkout FAILs."""
+
+    import hermes_kanban_lanes as package
+
+    rogue = tmp_path / "rogue" / "hermes_kanban_lanes"
+    rogue.mkdir(parents=True)
+    rogue_file = rogue / "__init__.py"
+    rogue_file.write_text("", encoding="utf-8")
+    monkeypatch.setattr(package, "__file__", str(rogue_file))
+    repo = make_repo()
+    config = _config(tmp_path, make_config, board, repo, fake_executor)
+    report = cli.doctor_report(config, str(tmp_path / "config.json"))
+    check = _checks(report)["plugin-runtime"]
+    assert check["ok"] is False
+    assert "plugin-runtime-import-outside-generation" in check["detail"]
 
 
 def test_doctor_lock_states(monkeypatch, tmp_path, doctor_env, make_config, board, make_repo, fake_executor):

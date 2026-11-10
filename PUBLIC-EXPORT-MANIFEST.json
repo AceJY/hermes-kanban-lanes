@@ -2,13 +2,18 @@
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "sha256": "a97d43a6e3150cf56e62598736b97bdd8542d18fde8e686b83cc49d1bf045fc0",
-      "size": 1332
+      "sha256": "28f41d280488dff28b7eedeca98c7d23960b0b824d87d2a965f0f94780ac1cb3",
+      "size": 1539
     },
     {
       "path": ".gitignore",
       "sha256": "d7d3cc3515569d9549561a3be368cbeb99d97e491e1033ed609886a42cd640db",
       "size": 176
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "836bbf1ff3a0210a4d3d3bfb7f4e416ccf0f39e0d956c902ffe9ff8f194b566f",
+      "size": 882
     },
     {
       "path": "CONTRIBUTING.md",
@@ -22,13 +27,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "1c6df042acaee6a8cad4d26684279e8d8613cee82ce7caafdafe9b9391f0f010",
-      "size": 14017
+      "sha256": "80e02fa8312efac8bc9464f6b47867bc7ec10f80579b915f1e1b4b92bc42d672",
+      "size": 18889
     },
     {
       "path": "README.zh-CN.md",
-      "sha256": "61209470d3b8513d07c2494985bf3fcdb34e16b1ab534bb30c488b56f467407b",
-      "size": 13630
+      "sha256": "15a08d78eb4a0b5b6b4a73b14e62fdc3537842a618bad36268a39043296b89d3",
+      "size": 18198
     },
     {
       "path": "SECURITY.md",
@@ -52,7 +57,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "c74350d5f6a69a08258092d56d46889112726274f83579a95dc09fce81f28acb",
+      "sha256": "c7687a8cabd62b55356117af3d3672c7f5dc66580dc0e50f36039a6ee6ea4090",
       "size": 1427
     },
     {
@@ -62,18 +67,18 @@
     },
     {
       "path": "src/hermes_kanban_lanes/card_contract.py",
-      "sha256": "28722cc007b0e6c1fd1c1372d6d95f86b90456763fe53642f8ebfcfe123d9b5a",
-      "size": 20450
+      "sha256": "d49bff92dc53aac9b39765abd680ab3190cec460f7539c4bfcc436b952315ecc",
+      "size": 20457
     },
     {
       "path": "src/hermes_kanban_lanes/cli.py",
-      "sha256": "cfd1be08dbaef351a78476bba05fae0f8ff8efdb284da60716cdf453bb0a282c",
-      "size": 50459
+      "sha256": "1c554a835a6a21cf23a8a7c19a90c2b3362914cbb803f20b069c4d5342803ccd",
+      "size": 56743
     },
     {
       "path": "src/hermes_kanban_lanes/config.py",
-      "sha256": "37ea7fdbdc1a6f3b6ede62fae75b81def7fc10a9a58fe1ad2bcc42951eb2e2c7",
-      "size": 29645
+      "sha256": "d74d33d689291cced568ddb65d99d02d5d1b469707c054461004a1ffca9a93ca",
+      "size": 29662
     },
     {
       "path": "src/hermes_kanban_lanes/contracts.py",
@@ -82,8 +87,8 @@
     },
     {
       "path": "src/hermes_kanban_lanes/executors/__init__.py",
-      "sha256": "bea72789829e4b30059d887492ed9961d43c395a79e4ca58f3ceb053813872af",
-      "size": 1025
+      "sha256": "62f0e5daee71cd427606c8694b6432d7137fc8686323149ffef6cf700f6a6214",
+      "size": 1094
     },
     {
       "path": "src/hermes_kanban_lanes/executors/base.py",
@@ -101,14 +106,19 @@
       "size": 16319
     },
     {
+      "path": "src/hermes_kanban_lanes/executors/dsh.py",
+      "sha256": "b84e079bc35d47ad05661c367ccfecead672d6052f90a6ad888b4e758892b8de",
+      "size": 7253
+    },
+    {
       "path": "src/hermes_kanban_lanes/hermes_adapter/__init__.py",
       "sha256": "6a0338a23c571882afa4b9be218c0ec18e9ba5ef89b5244b2631db2866d246db",
       "size": 908
     },
     {
       "path": "src/hermes_kanban_lanes/hermes_adapter/board.py",
-      "sha256": "a8928f0626d128f3b089c9cb4eee8cb4b4aee57b9a6b4bda88070c717f424353",
-      "size": 23635
+      "sha256": "736c2bf6cca144d4caa61a559a2aafdb48b365238ca4bff7892e3bcb62dd1982",
+      "size": 27377
     },
     {
       "path": "src/hermes_kanban_lanes/hermes_adapter/intents.py",
@@ -172,18 +182,18 @@
     },
     {
       "path": "src/hermes_kanban_lanes/runtime/release.py",
-      "sha256": "fcc0a699a43c5e734a7586fca84337bd785c3fd8d1aafdd4e01a3e53e9b0892c",
-      "size": 42329
+      "sha256": "24b9d3ebd0085ff1cc0f6682785109fa7bc407ef7244f227dd4a9f03589f90e7",
+      "size": 59997
     },
     {
       "path": "src/hermes_kanban_lanes/runtime/retention.py",
-      "sha256": "80f212f28062dcb18041dafcf5d702e06c9b45b6e1ca25ed7ad300cd947bc400",
-      "size": 15618
+      "sha256": "4f71aa296fdc8427e2e5f7d220daefde3ee5613ffbf6a099aa1d8d59e71c227f",
+      "size": 31127
     },
     {
       "path": "src/hermes_kanban_lanes/runtime/service.py",
-      "sha256": "e9dfab56a95038247933d0cf1620c2b99689940bb7e60a6f592ca8ba3a869ac1",
-      "size": 22760
+      "sha256": "5c472056be65777d7c3d679ae91b72b15a604f08f568114a8d51190247901cf8",
+      "size": 49089
     },
     {
       "path": "src/hermes_kanban_lanes/runtime/state.py",
@@ -192,8 +202,8 @@
     },
     {
       "path": "src/hermes_kanban_lanes/runtime/supervisor.py",
-      "sha256": "261337098920428e61b983d4ad167b28b4482ad2d90740beef50816cf088f413",
-      "size": 51872
+      "sha256": "85cc27036b0e60e14f1f7c7a79686f27c0f38c653feef8b82fea73764f8c9657",
+      "size": 54085
     },
     {
       "path": "src/hermes_kanban_lanes/verification/__init__.py",
@@ -272,8 +282,8 @@
     },
     {
       "path": "tests/integration/test_w3_recovery.py",
-      "sha256": "11440adf9dd9c189affa52356538b846396c8377276c7f5920daf46d1b2835b2",
-      "size": 17033
+      "sha256": "19bc2d12add362fda580a600b043e4caaa6fb2faf3afaa8b63ba5ddaa760018c",
+      "size": 18038
     },
     {
       "path": "tests/integration/test_w4_boundaries.py",
@@ -312,8 +322,8 @@
     },
     {
       "path": "tests/integration/test_w5_executor_registry.py",
-      "sha256": "5615a7a8b8fdbb7122f5ccf43463e62e55e473e184546b4f87cca7c13d915b39",
-      "size": 7913
+      "sha256": "87fadf29d3084bb3d1a3ff36d5533a24f682d60828b3488e0ddee3153236516f",
+      "size": 8154
     },
     {
       "path": "tests/integration/test_w6_cli_tick.py",
@@ -412,8 +422,8 @@
     },
     {
       "path": "tests/unit/test_package_install.py",
-      "sha256": "54e6cb8b63c9a1b83db6fae68a85272bc6724eea1786cdfd3718816261775bdc",
-      "size": 24732
+      "sha256": "c5968a42e4ba10c41ce626dfa3dc65a58c7afaf57570b39456d105a24bd3ff54",
+      "size": 24756
     },
     {
       "path": "tests/unit/test_release_authorization.py",
@@ -451,9 +461,39 @@
       "size": 5684
     },
     {
+      "path": "tests/unit/test_w11_merge_card.py",
+      "sha256": "e8f49f8f606843e1733c7d4a8ff4baffead54a2e2b35b61f70e02435d823dece",
+      "size": 6959
+    },
+    {
+      "path": "tests/unit/test_w11b_review_metadata.py",
+      "sha256": "455634447fd4074a75bf9c4d4de7360ab33ba72f4791353852e9e7af967123f2",
+      "size": 15770
+    },
+    {
+      "path": "tests/unit/test_w11c_retention.py",
+      "sha256": "3535c58a5c6a02a841b0e21267d085e7cface2551c5a4cf843909b745960ce73",
+      "size": 9687
+    },
+    {
+      "path": "tests/unit/test_w11d_review_head_alias.py",
+      "sha256": "84019af8f00d5a46888ecae1972e8752cb8a0b0ef8d43e16764ed47c4fc7b4cf",
+      "size": 13816
+    },
+    {
+      "path": "tests/unit/test_w12_dsh_adapter.py",
+      "sha256": "28ef29176904e2158eb91c13c48050b85d9b7136891dcebc60b69b7ab2b7ba5e",
+      "size": 9110
+    },
+    {
+      "path": "tests/unit/test_w13_worker_pid.py",
+      "sha256": "4e7d5149340563d3f5484a0845427fe030eca4436115b0c44d654b2d29e032fa",
+      "size": 15332
+    },
+    {
       "path": "tests/unit/test_w6_cli.py",
-      "sha256": "1da41a6e298e467bb1fba31c1b93082da3fea29f6debd09586bcdba00b53f411",
-      "size": 23977
+      "sha256": "ef1e107da7c3b11f15b59b7c7a2b4261f654fb4ac0dea3528c9991faa0365254",
+      "size": 24320
     },
     {
       "path": "tests/unit/test_w6_config.py",
@@ -462,8 +502,8 @@
     },
     {
       "path": "tests/unit/test_w6_doctor.py",
-      "sha256": "4d91640d4990860e2fb657c2c0a6dd6a4857785d3baf9e0d3d06bea42651fe62",
-      "size": 25808
+      "sha256": "d5471f5c00757a39ef2a337fd3658259dc8e89dd519088e44ea6bc6dab204434",
+      "size": 28800
     },
     {
       "path": "tests/unit/test_w6_receipt.py",
@@ -472,17 +512,17 @@
     },
     {
       "path": "tests/unit/test_w6_retention.py",
-      "sha256": "14bede6dba6b46878d365c944af40b9166c4f4bd47c28a003a8fc091f91277a1",
-      "size": 11993
+      "sha256": "066759afdbfddc0c2930e02ee4a2de1c4962e33d453ebae22e5988a73ab8efc2",
+      "size": 12347
     },
     {
       "path": "tests/unit/test_w6_service.py",
-      "sha256": "00fe5ee85ddd423bd74445bda8411c45a928ac59968a265c06486034ac4ea193",
-      "size": 29869
+      "sha256": "f4c0fe25e036de4a91112f7a0a29ce3174d9af9f189e3b24b28e2cffd0fc0fa7",
+      "size": 56217
     },
     {
       "path": "tests/unit/test_w6_upgrade.py",
-      "sha256": "15c47ff70220f7c123a4cd36318572f8cbf8fbc67272c49e1941bb3ea52740e2",
+      "sha256": "1a9672f22e285962d819f970cd769d128e632e2d1fd59b9e74e85499c2e6adfa",
       "size": 10440
     },
     {
@@ -492,8 +532,8 @@
     },
     {
       "path": "tools/public_export.py",
-      "sha256": "0d8d0fe492a3ad9070968c8878cfe413e8df82d38130a721d92f32a8f67a9c0d",
-      "size": 12198
+      "sha256": "7e7b652c1bddf732d1de4e1e67d465dd4855cdff2049d72f6ffbf19df5cf2c2f",
+      "size": 12218
     }
   ],
   "generator": "tools/public_export.py",

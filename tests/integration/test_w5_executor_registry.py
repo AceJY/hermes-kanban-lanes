@@ -18,6 +18,7 @@ from hermes_kanban_lanes.executors import (
     ADAPTERS,
     ClaudeAdapter,
     CodexAdapter,
+    DshAdapter,
     adapter_for,
 )
 from hermes_kanban_lanes.hermes_adapter.board import BoardAdapterError
@@ -74,12 +75,19 @@ def _isolated_credentials(tmp_path, monkeypatch):
 
 
 def test_registry_is_the_single_source_of_truth():
-    assert ADAPTERS == {"claude": ClaudeAdapter, "codex": CodexAdapter}
+    assert ADAPTERS == {
+        "claude": ClaudeAdapter,
+        "codex": CodexAdapter,
+        "dsh": DshAdapter,
+    }
     assert isinstance(adapter_for("claude"), ClaudeAdapter)
     assert isinstance(adapter_for("codex"), CodexAdapter)
+    assert isinstance(adapter_for("dsh"), DshAdapter)
     assert isinstance(daemon.executor_for("codex"), CodexAdapter)
+    assert isinstance(daemon.executor_for("dsh"), DshAdapter)
     assert daemon._executor_alias_supported("claude") is True
     assert daemon._executor_alias_supported("codex") is True
+    assert daemon._executor_alias_supported("dsh") is True
     assert daemon._executor_alias_supported("gemini") is False
 
 

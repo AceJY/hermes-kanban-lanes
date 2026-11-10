@@ -27,7 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_NAME = "hermes_kanban_lanes"
 DIST_NAME = "hermes-kanban-lanes"
-WHEEL_VERSION = "0.1.0"
+WHEEL_VERSION = "0.2.0"
 PUBLIC_EXPORT = REPO_ROOT / "tools" / "public_export.py"
 BUILD_WHEEL = REPO_ROOT / "tools" / "build_wheel.py"
 EXPORT_MANIFEST = "PUBLIC-EXPORT-MANIFEST.json"
@@ -67,6 +67,7 @@ EXPECTED_MODULES = {
     "executors/base.py",
     "executors/claude.py",
     "executors/codex.py",
+    "executors/dsh.py",
     "hermes_adapter/__init__.py",
     "hermes_adapter/board.py",
     "hermes_adapter/intents.py",

@@ -25,9 +25,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-OLD_VERSION = "0.1.0"
-NEW_VERSION = "0.2.0"
-BROKEN_VERSION = "0.3.0"
+OLD_VERSION = "0.2.0"
+NEW_VERSION = "0.3.0"
+BROKEN_VERSION = "0.4.0"
 
 
 def _clean_env(home: Path) -> dict[str, str]:

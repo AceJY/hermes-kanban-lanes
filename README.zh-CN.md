@@ -4,13 +4,37 @@
 
 [![CI](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml/badge.svg)](https://github.com/AceJY/hermes-kanban-lanes/actions/workflows/ci.yml)
 
-Hermes Kanban Lanes 是一个 fail-closed 的命令行工具，用于操作一条 Hermes
-Kanban 车道。它的子命令可以校验配置与卡片（`validate-config`、`validate-card`）、
-诊断单条车道（`doctor`）、执行一次 tick 或常驻轮询守护进程（`tick`、`run`），
-以及渲染和管理用户级服务单元（`service`）。
+**用 Hermes Kanban 驱动 Claude Code、Codex 和 DeepSeek Harness 干活——带验证门、可复核证据、评审/返工与可选合并闭环。**
 
-当前版本为 `0.1.0.dev0`。只有下面列出的安装形态和平台承诺是已声明的；其余内容
-一律视为未验证。
+Hermes Kanban Lanes（HKL）把一张 Hermes Kanban 看板变成编码 Agent 的控制面。卡上声明任务和允许改动的文件；HKL 领取后创建隔离的 git worktree，启动配置的执行体（`claude`、`codex` 或 `dsh`），对 diff 跑五项验证门，产出可复核的证据清单，再把卡推进到评审、返工或合并。看板始终是事实来源，执行体只负责改代码。
+
+```text
+Hermes Kanban 看板
+        │  卡：lane + development 契约
+        ▼
+HKL daemon ── 领取 ──► 隔离 git worktree
+        │                       │
+        │                       ▼
+        │            Claude Code / Codex / DSH
+        │                       │
+        ▼                       ▼
+   门 1：范围 · 测试 · 构建 · 产物
+        │
+        ├─ 失败 ──► 返工卡（有轮次上限）
+        └─ 通过 ──► 证据清单 ──► 评审 ──► 合并（可选）
+```
+
+### 支持的执行体
+
+| 执行体 | 配置键 | 说明 |
+|---|---|---|
+| **Claude Code** | `claude` | Anthropic 编码 CLI；生产环境已验证。 |
+| **Codex** | `codex` | OpenAI Codex CLI；适配器有测试覆盖。 |
+| **DeepSeek Harness (DSH)** | `dsh` | DSH headless JSON 模式（`dsh --profile headless --json`）；生产环境已验证。 |
+
+**为什么要一条车道，而不是一个 prompt：** 跑执行体是容易的部分。HKL 补的是判断“活是否真的干成了”的部分——文件范围约束、项目自己的测试/构建命令、可复核证据、有限轮次评审/返工、只从已评审 head 合并，以及 Hermes 升级后能重新解析 Python generation、不会静默死掉的常驻服务。
+
+当前版本为 `0.2.0`。只有下面列出的安装形态和平台承诺是已声明的；其余内容一律视为未验证。
 
 ## 能力边界
 
@@ -34,7 +58,7 @@ Kanban 车道。它的子命令可以校验配置与卡片（`validate-config`�
 - 一份位于 `hermes_commit` 所指定提交上的 Hermes 宿主源码检出。
 - 一个包含 `tasks` 表的 Kanban 看板 SQLite 数据库。
 - 一个供车道工作的可信 git 仓库。
-- `executors` 中声明的执行体二进制（`claude` 和/或 `codex`）位于 `PATH` 中，
+- `executors` 中声明的执行体二进制（`claude`、`codex` 和/或 `dsh`）位于 `PATH` 中，
   或使用绝对路径给出。
 
 平台承诺：
@@ -52,7 +76,7 @@ Kanban 车道。它的子命令可以校验配置与卡片（`validate-config`�
 从 wheel 安装：
 
 ```sh
-python -m pip install /path/to/hermes_kanban_lanes-0.1.0.dev0-py3-none-any.whl
+python -m pip install /path/to/hermes_kanban_lanes-0.2.0-py3-none-any.whl
 ```
 
 从源码检出安装：
@@ -68,7 +92,7 @@ python -m pip install dist/hermes_kanban_lanes-*.whl
 hermes-kanban-lanes --version
 ```
 
-该命令会打印已安装版本（例如 `0.1.0.dev0`）并以 `0` 退出。
+该命令会打印已安装版本（例如 `0.2.0`）并以 `0` 退出。
 
 ## 快速开始
 
@@ -136,7 +160,7 @@ hermes-kanban-lanes --version
 | `hermes_commit` | 是 | 期望的宿主 `HEAD`（40 或 64 位十六进制字符）。 |
 | `boards` | 是 | 看板别名到绝对 SQLite 路径的映射对象。 |
 | `repositories` | 是 | 仓库别名到 `{"path": "<absolute>", "trusted": true}` 的映射对象。 |
-| `executors` | 是 | 包含 `claude` 和/或 `codex` 的对象，每项为 `{"argv": ["<binary>", ...]}`。 |
+| `executors` | 是 | 包含 `claude`、`codex` 和/或 `dsh` 的对象，每项为 `{"argv": ["<binary>", ...]}`。 |
 | `work_root` | 是 | 用于锁、运行、卡片和日志的绝对可写目录。 |
 | `max_concurrent` | 是 | 正整数。 |
 | `review` | 否 | 评审人名称、返工上限、授权目录和合并策略。 |
@@ -180,7 +204,8 @@ hermes-kanban-lanes --version
   },
   "executors": {
     "claude": {"argv": ["claude"]},
-    "codex": {"argv": ["codex"]}
+    "codex": {"argv": ["codex"]},
+    "dsh": {"argv": ["dsh"]}
   },
   "work_root": "/absolute/path/to/work",
   "max_concurrent": 2,
@@ -210,11 +235,12 @@ hermes-kanban-lanes --version
 
 | 动作 | 命令 | 行为 |
 |---|---|---|
-| 渲染 | `service render --platform launchd\|systemd --config PATH --out DIR` | 只把一个单元文件写入 `DIR`，不做其他事。 |
-| 安装 | `service install --platform … --config PATH [--dry-run]` | 安装并加载用户级单元。 |
+| 渲染 | `service render --platform launchd\|systemd --config PATH --out DIR [--wheel WHEEL]` | 把一个单元文件写入 `DIR`；同时在服务元数据目录落盘与 generation 无关的 launcher 和 wheel。 |
+| 安装 | `service install --platform … --config PATH [--dry-run] [--wheel WHEEL]` | 落盘 launcher/wheel，安装并加载用户级单元。 |
 | 状态 | `service status --platform … --config PATH [--dry-run]` | 只读查询用户级单元状态。 |
 | 重启 | `service restart --platform … --config PATH` | 重启已安装的用户级单元。 |
 | 卸载 | `service uninstall --platform … --config PATH [--dry-run]` | 卸载 job 并删除单元文件。 |
+| 元数据 | — | 卸载后保留供诊断，见下文。 |
 
 - **macOS launchd** 是唯一声明支持生命周期的平台。单元是用户级 plist，通过当前
   用户 GUI 会话中的 `launchctl` 加载，服务以你的用户账户运行。
@@ -222,10 +248,43 @@ hermes-kanban-lanes --version
   `status`、`restart` 和 `uninstall` 会以 `service-platform-render-only`
   fail-closed，绝不执行 `systemctl`。
 - **Windows** 不支持；`tick` 和 `run` 使用的锁原语在该平台不可用。
-- 单元使用与 Hermes 安装绑定的启动命令，通过宿主的 `--print-runtime-command`
-  解析。若解析失败，命令会 fail-closed，而不会回落到当前解释器。
+- **与 generation 无关的 launcher**：单元不再固化 generation Python 路径，而是
+  启动 `$HOME/.hermes/kanban-lanes-service/runtime-launcher.py`。launcher 每次启动
+  都通过宿主 `--print-runtime-command` 重新解析运行时，在该 generation 内探针
+  `import hermes_kanban_lanes` 及 dist 版本，通过后才 exec 守护进程。只接受锚定在
+  `HERMES_HOME/installs/*/environments/*/venv` 下的 generation
+  `site-packages`/`dist-packages`；若解析到 store/tool Python 的 purelib，则
+  fail-closed 为 `generation-unanchored:<path>`，绝不向那里安装。记录的
+  `hermes_home` 锚点是 Hermes 根：会话 profile 路径
+  `<root>/profiles/<name>` 会归一为 `<root>`；若候选根都没有 `installs/`，
+  render/install 直接以 `service-hermes-home-unresolved` 失败。若新 generation
+  没有插件（`hermes update` 切换 generation 后的常态），或已暂存 wheel 的 sha256
+  与上次装入该 generation 的记录不同，launcher 会用随包 wheel 离线执行
+  `pip install --no-index --no-deps --force-reinstall --upgrade --target
+  <generation site-packages>`；generation 无 pip 时回退到
+  `uv pip install --offline --no-deps --reinstall --python <generation python>
+  --target <generation site-packages>`，随后再次探针。解析失败、wheel 缺失、安装
+  失败或探针仍失败都会以非零码退出，并写 marker；绝不回落到 `sys.executable`
+  或旧 generation。
+- **服务元数据目录**（`$HOME/.hermes/kanban-lanes-service/`）：`state.json`（render/
+  install 写入的状态文件：`product_version`、`hermes_source`/`hermes_launcher`、
+  `hermes_home` 锚点、`module` 与 `daemon_argv`、`config_path`、已暂存
+  `wheel` 及其 `wheel_sha256`、发现的 `uv`、以及各元数据路径）、
+  `runtime-launcher.py`（生成的纯标准库 launcher）、`wheel/`（当前产品 wheel
+  副本）、`installed.json`（最近一次成功安装：wheel sha256、时间、generation
+  路径）、`launcher.log`（解析/探针/安装记录，含 pip/uv stderr 尾部，不含凭据或
+  环境变量转储）和 `launch-failure.json`（任一次 launcher 失败时写入的 JSON
+  marker：时间、运行时路径、generation、原因；安装失败时含 `install_error`
+  stderr 尾部）。运行时解析失败时 `runtime` 与 `generation` 均为 `null`。wheel
+  依次从显式 `--wheel`、环境变量 `HERMES_KANBAN_LANES_WHEEL`/`HKL_WHEEL`、当前
+  安装的 `direct_url.json`、已暂存 wheel、本地 `dist/` 目录发现；全程不联网。
+- **每次 Hermes 升级后必须运行 `hermes kanban-lanes doctor`**。`plugin-runtime`
+  检查必须在新 generation 中 PASS；dist 缺失或版本不符会 FAIL，并打印确切的
+  `service install` 命令与当前 generation 路径。若服务启动自愈失败，先读
+  `$HOME/.hermes/kanban-lanes-service/launch-failure.json` 中的原因与运行时路径，再
+  重新执行 `service install`。
 - `uninstall` 只删除单元文件并卸载 job。它不会删除仓库、`work_root` 下的运行
-  证据或 Kanban 看板数据。
+  证据、Kanban 看板数据或服务元数据目录。
 
 ## 退出码
 
