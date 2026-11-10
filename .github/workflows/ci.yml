@@ -38,8 +38,13 @@ jobs:
       - name: Wheel bytes are reproducible
         run: python tools/build_wheel.py --out "${RUNNER_TEMP}/hkl-repro" --runs 2
 
-      - name: Unit and integration tests
+      - name: Unit and integration tests (macOS)
+        if: runner.os == 'macOS'
         run: python -m pytest tests -q
+
+      - name: Unit and integration tests (no launchd)
+        if: runner.os == 'Linux'
+        run: python -m pytest tests -q --ignore=tests/unit/test_w6_service.py
 
       - name: CLI version smoke
         run: hermes-kanban-lanes --version
