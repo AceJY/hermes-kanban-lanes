@@ -34,7 +34,8 @@ HKL daemon ── 领取 ──► 隔离 git worktree
 
 **为什么要一条车道，而不是一个 prompt：** 跑执行体是容易的部分。HKL 补的是判断“活是否真的干成了”的部分——文件范围约束、项目自己的测试/构建命令、可复核证据、有限轮次评审/返工、只从已评审 head 合并，以及 Hermes 升级后能重新解析 Python generation、不会静默死掉的常驻服务。
 
-当前版本为 `0.2.0`。只有下面列出的安装形态和平台承诺是已声明的；其余内容一律视为未验证。
+当前版本属于 `0.2.x` 线。确切版本以 `hermes-kanban-lanes --version` 的输出为准，
+每个版本改了什么见 `CHANGELOG.md`。只有下面列出的安装形态和平台承诺是已声明的；其余内容一律视为未验证。
 
 ## 能力边界
 
@@ -76,7 +77,7 @@ HKL daemon ── 领取 ──► 隔离 git worktree
 从 wheel 安装：
 
 ```sh
-python -m pip install /path/to/hermes_kanban_lanes-0.2.0-py3-none-any.whl
+python -m pip install /path/to/hermes_kanban_lanes-<version>-py3-none-any.whl
 ```
 
 从源码检出安装：
@@ -92,7 +93,7 @@ python -m pip install dist/hermes_kanban_lanes-*.whl
 hermes-kanban-lanes --version
 ```
 
-该命令会打印已安装版本（例如 `0.2.0`）并以 `0` 退出。
+该命令会打印已安装版本（例如 `0.2.7`）并以 `0` 退出。
 
 ## 快速开始
 

@@ -34,7 +34,9 @@ HKL daemon ── claim ──► isolated git worktree
 
 **Why a lane, not just a prompt:** running the harness is the easy part. HKL adds the parts that decide whether the work is real — file-scope enforcement, the project's own test and build commands, a reproducible evidence manifest, review with bounded rework, merge only from a reviewed head, and a resident service that re-resolves its Python generation after a Hermes upgrade instead of silently dying.
 
-This is `0.2.0`. Only the installation forms and platform promises listed below are claimed; treat everything else as unverified.
+This is the `0.2.x` line. The exact version is whatever `hermes-kanban-lanes --version`
+reports, and `CHANGELOG.md` records what each release changed. Only the installation
+forms and platform promises listed below are claimed; treat everything else as unverified.
 
 ## What this is — and is not
 
@@ -81,7 +83,7 @@ The project repository is <https://github.com/AceJY/hermes-kanban-lanes>.
 From a wheel:
 
 ```sh
-python -m pip install /path/to/hermes_kanban_lanes-0.2.0-py3-none-any.whl
+python -m pip install /path/to/hermes_kanban_lanes-<version>-py3-none-any.whl
 ```
 
 From a source checkout:
@@ -97,7 +99,7 @@ Confirm the installed distribution:
 hermes-kanban-lanes --version
 ```
 
-The command prints the installed version (for example `0.2.0`) and exits
+The command prints the installed version (for example `0.2.7`) and exits
 `0`.
 
 ## Quick start
