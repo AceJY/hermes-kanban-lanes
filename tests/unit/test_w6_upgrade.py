@@ -19,15 +19,22 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-OLD_VERSION = "0.2.0"
-NEW_VERSION = "0.3.0"
-BROKEN_VERSION = "0.4.0"
+# Versions are derived from the release version so a bump never needs a second
+# edit here; the upgrade test needs strictly increasing neighbours.
+CURRENT_VERSION = tomllib.loads(
+    (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+)["project"]["version"]
+_MAJOR, _MINOR, _ = (int(part) for part in CURRENT_VERSION.split("."))
+OLD_VERSION = CURRENT_VERSION
+NEW_VERSION = f"{_MAJOR}.{_MINOR + 1}.0"
+BROKEN_VERSION = f"{_MAJOR}.{_MINOR + 2}.0"
 
 
 def _clean_env(home: Path) -> dict[str, str]:

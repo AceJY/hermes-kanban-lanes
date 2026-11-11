@@ -15,6 +15,23 @@ from pathlib import Path
 from typing import Any, Mapping
 
 AUTHORIZATION_SCHEMA_VERSION = 1
+# Owner decision 2026-11-11: authorization may be synthesized by policy for
+# ordinary changes.  A synthesized record is auditable: its ``source`` says
+# ``policy`` and its approver is the reserved ``policy:auto`` identity, which a
+# human/file approval may never use.
+AUTHORIZATION_SOURCE_FILE = "file"
+AUTHORIZATION_SOURCE_POLICY = "policy"
+AUTHORIZATION_SOURCES = frozenset(
+    {AUTHORIZATION_SOURCE_FILE, AUTHORIZATION_SOURCE_POLICY}
+)
+POLICY_APPROVER = "policy:auto"
+POLICY_APPROVER_PREFIX = "policy:"
+# Synthesized records live in the release run directory, never in the
+# operator-owned ``<work_root>/authorizations/`` directory.
+POLICY_AUTHORIZATION_FILENAME = "authorization.json"
+# ``source`` is optional so every pre-existing authorization document keeps
+# loading unchanged; it is not part of the required field tuple.
+AUTHORIZATION_OPTIONAL_FIELDS = ("source",)
 AUTHORIZATION_FIELDS = (
     "schema_version",
     "requirement_id",
@@ -75,6 +92,7 @@ class ReleaseAuthorization:
     approved_at: int
     expires_at: int
     note: str | None = None
+    source: str | None = None
     path: str | None = None
     sha256: str | None = None
 
@@ -98,6 +116,8 @@ class ReleaseAuthorization:
         }
         if self.note is not None:
             document["note"] = self.note
+        if self.source is not None:
+            document["source"] = self.source
         if self.path is not None:
             document["path"] = self.path
         if self.sha256 is not None:
@@ -113,6 +133,7 @@ def authorization_problems(
     implementer: str | None = None,
     reviewer: str | None = None,
     executor: str | None = None,
+    allow_policy_approver: bool = False,
 ) -> list[str]:
     if authorization is None:
         return ["authorization-missing"]
@@ -128,6 +149,13 @@ def authorization_problems(
     approver = authorization.approver
     if not approver.strip():
         problems.append("authorization-approver-invalid")
+    elif (
+        approver.strip().startswith(POLICY_APPROVER_PREFIX)
+        and not allow_policy_approver
+    ):
+        # A file/human authorization must never claim the reserved policy
+        # identity: that would let a forged document bypass operator approval.
+        problems.append("authorization-policy-approver-forbidden")
     else:
         forbidden = {
             value
@@ -145,6 +173,50 @@ def authorization_problems(
             problems.append(f"authorization-mismatch:{field}")
 
     return list(dict.fromkeys(problems))
+
+
+def build_policy_authorization(
+    expected: Mapping[str, Any],
+    *,
+    approved_at: int,
+    expires_at: int,
+) -> ReleaseAuthorization | None:
+    """Synthesize the auditable policy record for one already-reviewed binding.
+
+    Every field is read from ``expected``, which the gate builds exclusively
+    from the current :class:`ReviewBinding` (never from caller input or raw
+    review metadata).  ``None`` means the binding is incomplete, so policy may
+    not mint a pass.  The result still has to pass
+    :func:`authorization_problems` before it can release anything.
+    """
+
+    values = {
+        field: expected.get(field)
+        for field in _BINDING_FIELDS + ("requirement_id", "main_ref", "main_commit")
+    }
+    if any(value is None for value in values.values()):
+        return None
+    try:
+        return ReleaseAuthorization(
+            schema_version=AUTHORIZATION_SCHEMA_VERSION,
+            requirement_id=str(values["requirement_id"]),
+            task_id=str(values["task_id"]),
+            review_run_id=int(values["review_run_id"]),
+            dev_run_id=int(values["dev_run_id"]),
+            rework_round=int(values["rework_round"]),
+            task_base_commit=str(values["task_base_commit"]),
+            reviewed_head=str(values["reviewed_head"]),
+            reviewed_tree=str(values["reviewed_tree"]),
+            evidence_index_sha256=str(values["evidence_index_sha256"]),
+            main_ref=str(values["main_ref"]),
+            main_commit=str(values["main_commit"]),
+            approver=POLICY_APPROVER,
+            approved_at=int(approved_at),
+            expires_at=int(expires_at),
+            source=AUTHORIZATION_SOURCE_POLICY,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def load_authorization(
@@ -166,7 +238,12 @@ def load_authorization(
         return None, ["authorization-invalid"]
 
     problems: list[str] = []
-    unknown = sorted(set(document) - set(AUTHORIZATION_FIELDS) - {"note"})
+    allowed = (
+        set(AUTHORIZATION_FIELDS)
+        | {"note"}
+        | set(AUTHORIZATION_OPTIONAL_FIELDS)
+    )
+    unknown = sorted(set(document) - allowed)
     if unknown:
         problems.append("authorization-invalid:" + ",".join(unknown[:8]))
     for field in AUTHORIZATION_FIELDS:
@@ -185,6 +262,11 @@ def load_authorization(
     note = document.get("note")
     if note is not None and not isinstance(note, str):
         problems.append("authorization-field-invalid:note")
+    source = document.get("source")
+    if source is not None and (
+        not isinstance(source, str) or source not in AUTHORIZATION_SOURCES
+    ):
+        problems.append("authorization-field-invalid:source")
     for field in ("review_run_id", "dev_run_id", "rework_round"):
         if not _is_positive_int(document.get(field)):
             problems.append(f"authorization-field-invalid:{field}")
@@ -230,6 +312,7 @@ def load_authorization(
             approved_at=int(document["approved_at"]),
             expires_at=int(document["expires_at"]),
             note=str(note) if note is not None else None,
+            source=str(source) if source is not None else None,
             path=str(target),
             sha256=digest,
         ),
@@ -239,8 +322,16 @@ def load_authorization(
 
 __all__ = [
     "AUTHORIZATION_FIELDS",
+    "AUTHORIZATION_OPTIONAL_FIELDS",
     "AUTHORIZATION_SCHEMA_VERSION",
+    "AUTHORIZATION_SOURCE_FILE",
+    "AUTHORIZATION_SOURCE_POLICY",
+    "AUTHORIZATION_SOURCES",
+    "POLICY_APPROVER",
+    "POLICY_APPROVER_PREFIX",
+    "POLICY_AUTHORIZATION_FILENAME",
     "ReleaseAuthorization",
     "authorization_problems",
+    "build_policy_authorization",
     "load_authorization",
 ]

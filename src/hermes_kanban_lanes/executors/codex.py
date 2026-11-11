@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -82,24 +83,78 @@ SANDBOX = "workspace-write"
 LAST_MESSAGE_NAME = "codex-last-message.txt"
 SETTINGS_FILENAME = "codex-settings.json"
 
-_AUTH_KEYWORDS = (
-    "login",
-    "authentication",
-    "401",
-    "403",
-    "unauthorized",
-    "api key",
-    "credit balance",
+# Phrase-level auth/capacity signals for the ``turn.failed`` message and
+# stderr.  Bare numeric substrings are deliberately absent: ``F401``, ``1401``
+# and URLs carrying a numeric ``id`` are not HTTP statuses.  Status codes are
+# handled by :func:`_http_signal` with token boundaries and line context.
+_AUTH_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\blogin\b",
+        r"\bauthentication",
+        r"\bunauthorized",
+        r"\bforbidden",
+        r"\bapi key\b",
+        r"\bcredit balance\b",
+    )
 )
-_CAPACITY_KEYWORDS = (
-    "rate limit",
-    "429",
-    "503",
-    "overloaded",
-    "network",
-    "econnreset",
-    "etimedout",
+_CAPACITY_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\brate[\s_-]*limit(?:ed)?\b",
+        r"\boverloaded\b",
+        r"\btoo many requests\b",
+        r"\bservice unavailable\b",
+        r"\bnetwork\b",
+        r"\beconnreset\b",
+        r"\betimedout\b",
+        r"\btimeout\b",
+        r"\btimed out\b",
+    )
 )
+_HTTP_STATUS = re.compile(r"\b(401|403|429|503)\b")
+# ``\bhttp\b`` intentionally does not match the ``https`` scheme, so a URL that
+# merely contains ``?id=1401`` is never read as a 401.
+_HTTP_CONTEXT = re.compile(r"\b(?:http|status|error)\b", re.IGNORECASE)
+_AUTH_STATUSES = frozenset({401, 403})
+_CAPACITY_STATUSES = frozenset({429, 503})
+
+
+def _http_signal(*texts: str) -> str | None:
+    """Return ``"auth"``/``"capacity"`` for contextual HTTP status tokens.
+
+    A code counts only when it appears as an independent token on a line that
+    also carries http/status/error semantics.  Auth wins when both appear.
+    """
+
+    auth = False
+    capacity = False
+    for text in texts:
+        for line in (text or "").splitlines():
+            if not _HTTP_CONTEXT.search(line):
+                continue
+            for match in _HTTP_STATUS.finditer(line):
+                code = int(match.group(1))
+                if code in _AUTH_STATUSES:
+                    auth = True
+                elif code in _CAPACITY_STATUSES:
+                    capacity = True
+    if auth:
+        return "auth"
+    if capacity:
+        return "capacity"
+    return None
+
+
+def _phrase_signal(text: str) -> str | None:
+    """Return the auth/capacity phrase signal in ``text`` (auth wins)."""
+
+    lowered = (text or "").lower()
+    if any(pattern.search(lowered) for pattern in _AUTH_PATTERNS):
+        return "auth"
+    if any(pattern.search(lowered) for pattern in _CAPACITY_PATTERNS):
+        return "capacity"
+    return None
 _TOKEN_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -395,17 +450,21 @@ class CodexAdapter:
 
         if "failure" in parsed:
             failure = parsed.get("failure")
-            haystack = " ".join(
-                part
-                for part in (
-                    failure if isinstance(failure, str) else "",
-                    stderr or "",
+            failure_text = failure if isinstance(failure, str) else ""
+            # Only the CLI-authored failure message and stderr participate; the
+            # last agent message is model prose and never a classification
+            # signal.  Numeric tokens get HTTP context checks, so ``1401`` or
+            # ``F401`` inside a message cannot masquerade as auth failure.
+            signal = _http_signal(failure_text, stderr or "")
+            if signal is None:
+                signal = _phrase_signal(
+                    "\n".join(
+                        part for part in (failure_text, stderr or "") if part
+                    )
                 )
-                if part
-            ).lower()
-            if any(keyword in haystack for keyword in _AUTH_KEYWORDS):
+            if signal == "auth":
                 return outcome("environment_failure", "capability")
-            if any(keyword in haystack for keyword in _CAPACITY_KEYWORDS):
+            if signal == "capacity":
                 return outcome("environment_failure", "transient")
             return outcome("code_failure", "needs_input")
 

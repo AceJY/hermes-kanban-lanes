@@ -34,6 +34,34 @@ from .intents import apply_intent as _apply_intent
 SCHEMA_VERSION = 1
 _HOST_MODULES: dict[str, tuple[Any, Any, Any]] = {}
 
+# Reviewer receipts have drifted across reviewer implementations.  These are the
+# *only* synonyms HKL accepts, and each one was confirmed against a real receipt
+# shape before being added here.  There is deliberately no rule that treats a
+# key as a reviewed head merely because its name contains "sha" or "commit".
+REVIEW_HEAD_KEYS: tuple[str, ...] = (
+    "reviewed_head",
+    "reviewed_commit",
+    "frozen_commit",
+)
+REVIEW_TREE_KEYS: tuple[str, ...] = (
+    # ``frozen_tree`` is deliberately *not* here.  Production receipts use it
+    # for a frozen-worktree descriptor (a dict on run 620) or a temporary path
+    # (run 625), never for a git tree id.  It is still a receipt marker below,
+    # so such a receipt is reported, never dropped; the tree itself is derived
+    # from the reviewed commit.
+    "reviewed_tree",
+)
+REVIEW_RECEIPT_KEYS: frozenset[str] = frozenset(
+    {
+        *REVIEW_HEAD_KEYS,
+        *REVIEW_TREE_KEYS,
+        "frozen_tree",
+        "verdict",
+        "review_outcome",
+        "review_round",
+    }
+)
+
 
 class BoardAdapterError(RuntimeError):
     """Raised when the board/host cannot be opened or used safely."""
@@ -436,14 +464,20 @@ class BoardAdapter:
         return result
 
     def review_runs(self, task_id: str) -> list[dict[str, Any]]:
-        """Runs carrying a reviewer verdict document (D1 metadata).
+        """Runs carrying a reviewer receipt.
 
-        Reviewer cards have drifted between ``reviewed_head`` and
-        ``reviewed_commit`` for the same fact.  Both keys identify the reviewed
-        commit, so either marks a review record and the returned entry always
-        carries a normalised ``reviewed_head`` (the original keys stay for
-        audit).  When both keys are present but disagree nothing is guessed:
-        the entry is flagged as a conflict and the release layer skips it.
+        A review receipt is any run whose metadata carries one of
+        :data:`REVIEW_RECEIPT_KEYS` -- never a run whose metadata merely looks
+        sha-ish.  Reviewer cards have drifted between several spellings for the
+        same facts; the confirmed synonyms in ``REVIEW_HEAD_KEYS`` /
+        ``REVIEW_TREE_KEYS`` are normalised into ``reviewed_head`` /
+        ``reviewed_tree`` while every original key stays for audit.
+
+        A receipt without any head key is **not dropped**: it is returned with
+        ``review_receipt_problem`` so the release layer can name it instead of
+        silently believing the card was never reviewed.  Two present-but-
+        different spellings are a contradiction and stay ``None`` (fail
+        closed, never pick one).
         """
 
         reviews: list[dict[str, Any]] = []
@@ -451,32 +485,87 @@ class BoardAdapter:
             metadata = entry.get("metadata")
             if not isinstance(metadata, dict):
                 continue
-            has_head = "reviewed_head" in metadata
-            has_commit = "reviewed_commit" in metadata
-            if not has_head and not has_commit:
+            if not REVIEW_RECEIPT_KEYS.intersection(metadata):
                 continue
-            if (
-                has_head
-                and has_commit
-                and metadata["reviewed_head"] != metadata["reviewed_commit"]
-            ):
+
+            head_fields = [
+                (key, metadata[key]) for key in REVIEW_HEAD_KEYS if key in metadata
+            ]
+            tree_fields = [
+                (key, metadata[key]) for key in REVIEW_TREE_KEYS if key in metadata
+            ]
+            # Only string values can be a commit/tree id.  Anything else (a
+            # dict, a list, ``None``) is never mapped and never compared: an
+            # unhashable value used to raise TypeError inside the set
+            # comprehension and crash the whole queue pass.  A receipt whose
+            # only head value is unusable gets a named problem instead.
+            head_strings = [
+                (key, value)
+                for key, value in head_fields
+                if isinstance(value, str) and value
+            ]
+            tree_strings = [
+                (key, value)
+                for key, value in tree_fields
+                if isinstance(value, str) and value
+            ]
+            head_conflict = len({value for _, value in head_strings}) > 1
+            tree_conflict = len({value for _, value in tree_strings}) > 1
+            aliases: list[str] = []
+            normalised = dict(metadata)
+
+            if not head_fields:
+                # The receipt exists but names no reviewed commit.  Return it
+                # (do not drop it) so ``queue_release_cards`` can report
+                # ``review-receipt-unknown-keys:<card>``.
+                entry["reviewed_head"] = None
+                entry["review_receipt_problem"] = "reviewed-head-missing"
+                entry["review_receipt_keys"] = sorted(metadata)
+            elif not head_strings:
+                # A head key exists, but its value is not a string id.
+                entry["reviewed_head"] = None
+                entry["review_receipt_problem"] = "reviewed-head-invalid"
+                entry["review_receipt_keys"] = sorted(metadata)
+                entry["review_receipt_invalid_keys"] = [key for key, _ in head_fields]
+            elif head_conflict:
                 # Fail closed: never pick one spelling over the other.
                 entry["reviewed_head"] = None
-                entry["reviewed_head_conflict"] = {
-                    "reviewed_head": metadata["reviewed_head"],
-                    "reviewed_commit": metadata["reviewed_commit"],
-                }
-                reviews.append(entry)
-                continue
-            reviewed_head = (
-                metadata["reviewed_head"] if has_head else metadata["reviewed_commit"]
-            )
-            entry["reviewed_head"] = reviewed_head
-            if not has_head:
-                # Add the normalised key without overwriting ``reviewed_commit``.
-                normalised = dict(metadata)
+                entry["review_receipt_problem"] = "reviewed-head-conflict"
+                entry["reviewed_head_conflict"] = dict(head_strings)
+            else:
+                head_key, reviewed_head = head_strings[0]
+                entry["reviewed_head"] = reviewed_head
                 normalised["reviewed_head"] = reviewed_head
-                entry["metadata"] = normalised
+                if head_key != "reviewed_head":
+                    aliases.append(head_key)
+
+            if not tree_conflict and tree_strings:
+                tree_key, reviewed_tree = tree_strings[0]
+                entry["reviewed_tree"] = reviewed_tree
+                normalised["reviewed_tree"] = reviewed_tree
+                if tree_key != "reviewed_tree":
+                    aliases.append(tree_key)
+            elif tree_conflict:
+                # Same rule as the head: two facts that disagree are kept for
+                # audit, but nothing is guessed.
+                entry["reviewed_tree_conflict"] = dict(tree_strings)
+                entry["review_receipt_problem"] = (
+                    entry.get("review_receipt_problem") or "reviewed-tree-conflict"
+                )
+            elif tree_fields:
+                # Present but unusable (not a string): never map it.  The
+                # release layer derives the tree from the reviewed commit.
+                entry["reviewed_tree_problem"] = "reviewed-tree-invalid"
+                entry["review_receipt_invalid_keys"] = sorted(
+                    {
+                        *(entry.get("review_receipt_invalid_keys") or []),
+                        *(key for key, _ in tree_fields),
+                    }
+                )
+
+            entry["metadata"] = normalised
+            if aliases:
+                entry["review_receipt_aliases"] = aliases
             reviews.append(entry)
         return reviews
 

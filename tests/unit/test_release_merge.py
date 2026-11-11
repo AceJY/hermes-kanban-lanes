@@ -21,6 +21,7 @@ from hermes_kanban_lanes.release.merge import (
     merge_release,
     run_post_merge,
 )
+from hermes_kanban_lanes.runtime.release import _finalise_release_report
 from hermes_kanban_lanes.verification.evidence import sha256_file
 from hermes_kanban_lanes.workspace.git import repo_head, run_git
 
@@ -218,8 +219,12 @@ def test_merge_uses_the_fixed_identity_when_git_env_is_exported(
     )
 
 
-def test_parent_set_mismatch_is_refused(tmp_path, monkeypatch):
-    """D7: the merge commit must have exactly ``main_before`` and ``reviewed``."""
+def test_parent_set_mismatch_is_recorded_as_merged_with_failures(tmp_path, monkeypatch):
+    """D7: the merge commit must have exactly ``main_before`` and ``reviewed``.
+
+    The commit already exists, so the honest record is "merged + follow-up
+    failure", not ``refused`` (which would imply main never moved).
+    """
 
     repo, base = _init_repo(tmp_path)
     head = _branch_commit(
@@ -233,9 +238,12 @@ def test_parent_set_mismatch_is_refused(tmp_path, monkeypatch):
     run_dir = tmp_path / "release"
     record = _merge(repo, run_dir, head, base, allow=["RESULT.txt"])
     assert record.ok is False
+    assert record.merged is True
     assert record.reasons == ("parents-mismatch",), record.reasons
     document = _document(run_dir)
-    assert document["verdict"] == "refused"
+    assert document["verdict"] == "merged-with-failures"
+    assert document["merged"] is True
+    assert document["merge_sha"] == repo_head(repo)
     assert document["parents"] == [base, wrong]
 
 
@@ -381,11 +389,17 @@ def test_conflict_aborts_and_leaves_main_untouched(tmp_path):
     assert "merge-conflict" in record.reasons, record.reasons
     document = _document(tmp_path / "release")
     assert document["verdict"] == "refused"
+    assert document["merged"] is False
+    # A conflicting merge cannot create a commit, so it is attempted and
+    # aborted; the metadata never advances.
     assert document["aborted"] is True
+    assert document["command"]["exit_code"] != 0
+    assert "preflight" not in document["command"]
     assert document["merge_sha"] is None
     assert repo_head(repo) == main_before
     assert _git("status", "--porcelain", cwd=repo) == ""
     assert _git_code("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=repo) != 0
+    assert (tmp_path / "release" / "merge.stdout.log").exists()
 
 
 def test_failed_abort_is_named_and_keeps_the_scene(tmp_path, monkeypatch):
@@ -425,32 +439,92 @@ def test_failed_abort_maps_to_a_capability_block():
     assert _release_reason_kind(("merge-abort-failed",)) == "capability"
 
 
-def test_outside_allow_is_counted_and_named(tmp_path):
+def test_outside_allow_is_refused_before_the_branch_moves(tmp_path):
+    """A scope violation must be decided before ``git merge``.
+
+    A refusal that only happens after the merge commit exists is fail-open:
+    the code is already on ``main``.  Assert the git state is byte-for-byte
+    unchanged, not merely that ``record.ok`` is False.
+    """
+
     repo, base = _init_repo(tmp_path)
     head = _branch_commit(
         repo, base, "task", {"outside.txt": "x\n"}, "run 1", tmp_path=tmp_path
     )
+    refs_before = _refs(repo)
+    status_before = _git("status", "--porcelain", "-uall", cwd=repo)
     record = _merge(repo, tmp_path / "release", head, base, allow=["src/"])
     assert not record.ok
+    assert record.merged is False
     assert "outside-allow:1" in record.reasons, record.reasons
     document = _document(tmp_path / "release")
+    assert document["verdict"] == "refused"
     assert document["outside_allow"] == 1
     assert document["outside_allow_paths"] == ["outside.txt"]
-    # The merge commit is honestly recorded, not silently reverted.
-    assert document["merge_sha"] == repo_head(repo)
+    assert document["command"]["preflight"] == "merge-tree"
+    # Nothing moved: same main, same refs, clean tree, no merge in progress.
+    assert repo_head(repo) == base
+    assert _refs(repo) == refs_before
+    assert _git("log", "-1", "--format=%H", cwd=repo) == base
+    assert _git("status", "--porcelain", "-uall", cwd=repo) == status_before
+    assert _git_code("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=repo) != 0
 
 
-def test_protected_root_is_named_separately(tmp_path):
+def test_protected_root_is_refused_before_the_branch_moves(tmp_path):
+    """D7/protection: a hard protected root is a pre-merge refusal."""
+
     repo, base = _init_repo(tmp_path)
     head = _branch_commit(
         repo, base, "task", {"tools/tool.sh": "#!/bin/sh\n"}, "run 1", tmp_path=tmp_path
     )
+    refs_before = _refs(repo)
     record = _merge(repo, tmp_path / "release", head, base, allow=["tools/tool.sh"])
     assert not record.ok
-    assert "protected-root-touched:1" in record.reasons, record.reasons
+    assert record.merged is False
+    assert record.reasons == ("protected-root-touched:1",), record.reasons
     document = _document(tmp_path / "release")
+    assert document["verdict"] == "refused"
+    assert document["protected_roots_touched"] == 1
     assert document["protected_root_paths"] == ["tools/tool.sh"]
+    assert document["merge_sha"] is None
     assert "tools/" in DEFAULT_PROTECTED_ROOTS
+    # Byte-for-byte unchanged main/worktree.
+    assert repo_head(repo) == base
+    assert _refs(repo) == refs_before
+    assert _git("status", "--porcelain", "-uall", cwd=repo) == ""
+    assert _git_code("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=repo) != 0
+
+
+def test_protected_root_outranks_outside_allow_in_the_named_reason(tmp_path):
+    """Shape A: allow only ``docs/x.md`` but the reviewed branch changed
+    ``tools/y.sh``.  The card's block reason is ``reasons[0]``, so the hard
+    protected-root violation must be the first named reason even though the
+    same path is also outside the allow list."""
+
+    repo, base = _init_repo(tmp_path)
+    head = _branch_commit(
+        repo,
+        base,
+        "task",
+        {"docs/x.md": "docs\n", "tools/y.sh": "#!/bin/sh\n"},
+        "run 1",
+        tmp_path=tmp_path,
+    )
+    refs_before = _refs(repo)
+    record = _merge(repo, tmp_path / "release", head, base, allow=["docs/x.md"])
+    assert not record.ok
+    assert record.merged is False
+    assert record.reasons[0] == "protected-root-touched:1", record.reasons
+    assert "outside-allow:1" in record.reasons, record.reasons
+    document = _document(tmp_path / "release")
+    assert document["verdict"] == "refused"
+    assert document["protected_root_paths"] == ["tools/y.sh"]
+    assert document["outside_allow_paths"] == ["tools/y.sh"]
+    assert document["merge_sha"] is None
+    assert repo_head(repo) == base
+    assert _refs(repo) == refs_before
+    assert _git("status", "--porcelain", "-uall", cwd=repo) == ""
+    assert _git_code("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=repo) != 0
 
 
 def test_merge_that_changes_reviewed_paths_is_named(tmp_path):
@@ -478,11 +552,15 @@ def test_merge_that_changes_reviewed_paths_is_named(tmp_path):
 
     record = _merge(repo, tmp_path / "release", head, main_before, allow=["RESULT.txt"])
     assert not record.ok
+    assert record.merged is False
     assert "merge-changed-reviewed-paths:1" in record.reasons, record.reasons
     document = _document(tmp_path / "release")
     assert document["reviewed_paths_changed_by_merge"] == ["RESULT.txt"]
     assert document["changed_paths"] == []
-    assert document["merge_sha"] is not None
+    # The dry-run tree already shows the merge driver changing a reviewed
+    # path, so the refusal happens before the branch moves.
+    assert document["merge_sha"] is None
+    assert repo_head(repo) == main_before
 
 
 # ---------------------------------------------------------------------------
@@ -601,3 +679,115 @@ def test_postmerge_worktree_failure_is_reported(tmp_path):
     assert document["reasons"][0].startswith("postmerge-worktree-failed:")
     assert document["commands"] == []
     assert _report(run_dir) == document
+
+
+# ---------------------------------------------------------------------------
+# W4-01/F1: one release, one final verdict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "merge_reasons",
+    [
+        ("main-moved",),
+        ("merge-conflict",),
+        ("merge-tree-error:128",),
+        ("merge-abort-failed",),
+        ("protected-root-touched:1",),
+        ("outside-allow:2", "merge-changed-reviewed-paths:1"),
+    ],
+)
+def test_finalise_keeps_the_gate_verdict_and_one_release_verdict(
+    tmp_path, merge_reasons
+):
+    """F1: ``verdict`` is the gate verdict for *every* pre-merge refusal.
+
+    The old code rewrote it to ``refused`` only for the scope family, so the
+    same field meant two different things and ``release-ready`` coexisted with
+    ``refused`` for ``main-moved``/``merge-conflict``/... .  The final outcome
+    lives only in ``release_verdict`` (backed by reasons/merged/merge_sha), so
+    ``verdict`` must stay the gate's ``release-ready`` in all these cases.
+
+    Mutation guard: restoring the scope-only overwrite fails the
+    ``protected-root-touched:1`` case; rewriting every refusal (option 乙)
+    fails every case.
+    """
+
+    run_dir = tmp_path / "release"
+    run_dir.mkdir()
+    (run_dir / "release-report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "requirement_id": REQUIREMENT,
+                "verdict": "release-ready",
+                "reasons": [],
+                "checks": [{"name": "merge_enabled", "ok": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "merge.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "verdict": "refused",
+                "reasons": list(merge_reasons),
+                "merge_sha": None,
+                "changed_paths": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    digest = _finalise_release_report(
+        run_dir,
+        main_before="a" * 40,
+        merge_sha=None,
+        merge_tree=None,
+        merge_verdict="refused",
+        merge_reasons=merge_reasons,
+        merged=False,
+        postmerge=None,
+    )
+
+    report_path = run_dir / "release-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["verdict"] == "release-ready", report
+    assert report["release_verdict"] == "refused", report
+    assert report["reasons"] == list(merge_reasons), report
+    assert report["merged"] is False, report
+    assert report["merge_sha"] is None, report
+    assert report["postmerge"] is None, report
+    assert report["merge"]["verdict"] == "refused", report["merge"]
+    assert report["merge"]["reasons"] == list(merge_reasons), report["merge"]
+    assert digest == sha256_file(report_path)
+
+
+def test_finalise_keeps_the_gate_verdict_after_a_merged_release(tmp_path):
+    """The same field keeps the same meaning on the success path."""
+
+    run_dir = tmp_path / "release"
+    run_dir.mkdir()
+    (run_dir / "release-report.json").write_text(
+        json.dumps({"schema_version": 1, "verdict": "release-ready", "reasons": []}),
+        encoding="utf-8",
+    )
+    postmerge = {"verdict": "pass", "reasons": [], "commands": []}
+    _finalise_release_report(
+        run_dir,
+        main_before="a" * 40,
+        merge_sha="b" * 40,
+        merge_tree="c" * 40,
+        merge_verdict="merged",
+        merge_reasons=(),
+        merged=True,
+        postmerge=postmerge,
+    )
+    report = json.loads((run_dir / "release-report.json").read_text(encoding="utf-8"))
+    assert report["verdict"] == "release-ready", report
+    assert report["release_verdict"] == "merged", report
+    assert report["reasons"] == [], report
+    assert report["merged"] is True, report
+    assert report["merge_sha"] == "b" * 40, report
+    assert report["postmerge"] == postmerge, report

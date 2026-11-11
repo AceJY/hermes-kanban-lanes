@@ -18,15 +18,27 @@ from typing import Any, Mapping, Sequence
 from ..card_contract import CardSpec
 from ..config import LaneConfig
 from ..contracts import RunIdentity
-from ..hermes_adapter.board import BoardAdapter
+from ..hermes_adapter.board import (
+    REVIEW_HEAD_KEYS,
+    REVIEW_RECEIPT_KEYS,
+    REVIEW_TREE_KEYS,
+    BoardAdapter,
+)
 from ..verification.evidence import INDEX_RELATIVE_PATH, sha256_file
 from ..workspace.git import GitError, abort_merge, repo_head, run_git
 from ..release.binding import evaluate_binding
-from ..release.gate import RELEASE_REQUIREMENT_ID, release_preflight
+from ..release.gate import (
+    RELEASE_REPORT_FILENAME,
+    RELEASE_REQUIREMENT_ID,
+    release_preflight,
+)
 from ..release.merge import (
     MERGE_TIMEOUT,
+    merge_notification_sent,
     merge_release,
+    notify_report_path,
     record_existing_merge,
+    run_merge_notify,
     run_post_merge,
 )
 from ..release.state import (
@@ -433,25 +445,39 @@ def _review_release_metadata(
     except (TypeError, ValueError):
         run_id = 0
 
-    # Reviewer cards have drifted between two spellings of the same fact.
-    # ``reviewed_head`` wins; ``reviewed_commit`` is accepted as its alias.
-    # Two present-but-different values are a contradiction: fail closed
-    # instead of choosing one.
-    has_head = "reviewed_head" in raw
-    has_commit = "reviewed_commit" in raw
-    head_conflict = (
-        has_head
-        and has_commit
-        and raw.get("reviewed_head") != raw.get("reviewed_commit")
+    # Reviewer cards have drifted between several spellings of the same fact.
+    # ``REVIEW_HEAD_KEYS`` are the confirmed synonyms only; a key is never
+    # accepted merely because its name mentions "sha" or "commit".  The
+    # canonical spelling wins, any present-but-different pair is a
+    # contradiction, and nothing is guessed from a contradictory receipt.
+    head_fields = [(key, raw[key]) for key in REVIEW_HEAD_KEYS if key in raw]
+    tree_fields = [(key, raw[key]) for key in REVIEW_TREE_KEYS if key in raw]
+    # Only strings are ids.  A dict/list value is never hashed (that used to
+    # raise TypeError and take down the whole queue pass) and never mapped.
+    head_strings = [
+        (key, value)
+        for key, value in head_fields
+        if isinstance(value, str) and value
+    ]
+    tree_strings = [
+        (key, value)
+        for key, value in tree_fields
+        if isinstance(value, str) and value
+    ]
+    head_conflict = len({value for _, value in head_strings}) > 1
+    tree_conflict = len({value for _, value in tree_strings}) > 1
+    reviewed_head = (
+        None if head_conflict or not head_strings else head_strings[0][1]
     )
-    if head_conflict:
-        reviewed_head = None
-    elif has_head:
-        reviewed_head = raw.get("reviewed_head")
-    else:
-        reviewed_head = raw.get("reviewed_commit")
 
+    # A native reviewer run records the profile that produced it, not the
+    # ``reviewer`` metadata key.  The run identity is a mechanical fact, so
+    # fall back to it instead of guessing from summary text; the binding below
+    # still rejects a profile that matches the implementer.
     reviewer = raw.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer:
+        profile = review_run.get("profile")
+        reviewer = profile if isinstance(profile, str) and profile else None
     review_outcome = raw.get("review_outcome")
 
     verdict = raw.get("verdict")
@@ -464,10 +490,24 @@ def _review_release_metadata(
         verdict = _REVIEW_OUTCOME_VERDICTS.get(outcome)
 
     problem: str | None = None
-    if head_conflict:
+    if not head_fields:
+        # A receipt that names no reviewed commit is a *named* refusal, so the
+        # queue can report ``review-receipt-unknown-keys:<card>``.
+        problem = "reviewed-head-missing"
+    elif not head_strings:
+        # Head key(s) present but no usable string id.
+        problem = "reviewed-head-invalid"
+    elif head_conflict:
         problem = "reviewed-head-conflict"
+    elif tree_conflict:
+        problem = "reviewed-tree-conflict"
+    elif tree_fields and not tree_strings:
+        # Tree is derivable, but a present-and-unusable value is still named.
+        problem = "reviewed-tree-invalid"
     elif verdict is None:
         problem = "verdict"
+    if reviewer is None:
+        problem = problem or "reviewer"
 
     dev_run_id = raw.get("dev_run_id")
     usable_dev_run_id = (
@@ -506,11 +546,15 @@ def _review_release_metadata(
             except OSError:
                 problem = problem or "evidence-index-missing"
 
-    reviewed_tree = raw.get("reviewed_tree")
-    if not isinstance(reviewed_tree, str) or not reviewed_tree:
-        reviewed_tree = _reviewed_tree_for(
-            reviewed_head, dev_run_dir, dev_document, config
-        )
+    if tree_conflict or (tree_fields and not tree_strings):
+        # Never derive over a contradiction, and never map a non-string.
+        reviewed_tree = None
+    else:
+        reviewed_tree = tree_strings[0][1] if tree_strings else None
+        if not isinstance(reviewed_tree, str) or not reviewed_tree:
+            reviewed_tree = _reviewed_tree_for(
+                reviewed_head, dev_run_dir, dev_document, config
+            )
 
     rework_round = raw.get("rework_round")
     if not isinstance(rework_round, int) or isinstance(rework_round, bool):
@@ -561,10 +605,17 @@ def _review_release_metadata(
             "evidence_index_sha256": evidence_sha,
         }
     )
-    if not head_conflict:
+    aliases: list[str] = []
+    if not head_conflict and head_strings:
         # Fill the canonical key (or accept the alias); on a contradiction the
-        # original ``reviewed_head`` stays untouched for audit.
+        # original spelling stays untouched for audit.
         normalised["reviewed_head"] = reviewed_head
+        if head_strings[0][0] != "reviewed_head":
+            aliases.append(head_strings[0][0])
+    if not tree_conflict and tree_strings:
+        normalised["reviewed_tree"] = reviewed_tree
+        if tree_strings[0][0] != "reviewed_tree":
+            aliases.append(tree_strings[0][0])
     normalised.setdefault("reasons", [])
 
     reason = f"{INCOMPLETE_REVIEW_METADATA}:{problem}" if problem else None
@@ -581,6 +632,7 @@ def _review_release_metadata(
         "problem": problem,
         "reason": reason,
         "metadata": normalised,
+        "aliases": [f"review-receipt-alias:{key}" for key in aliases],
         "dev_run_dir": str(dev_run_dir) if dev_run_dir is not None else None,
     }
 
@@ -605,10 +657,8 @@ def _normalise_review_runs(
             normalised_runs.append(run)  # type: ignore[arg-type]
             continue
         metadata = run.get("metadata")
-        if not isinstance(metadata, Mapping) or (
-            "reviewed_head" not in metadata
-            and "reviewed_commit" not in metadata
-            and "verdict" not in metadata
+        if not isinstance(metadata, Mapping) or not REVIEW_RECEIPT_KEYS.intersection(
+            metadata
         ):
             normalised_runs.append(dict(run))
             continue
@@ -741,6 +791,69 @@ def _snapshot_skip(task_id: str, reason: str, detail: str | None = None) -> dict
     }
 
 
+def _review_receipt_skip(task_id: str, detail: str) -> dict[str, Any]:
+    """A review receipt the queue could not map to a reviewed commit.
+
+    The operator-facing reason names the card explicitly, so "review passed but
+    nothing was queued" can never happen without a matching line here.
+    """
+
+    return _snapshot_skip(
+        task_id, f"review-receipt-unknown-keys:{task_id}", detail
+    )
+
+
+def _review_receipt_detail(run: Mapping[str, Any]) -> str:
+    metadata = run.get("metadata")
+    keys = run.get("review_receipt_keys")
+    if not keys:
+        keys = sorted(metadata) if isinstance(metadata, Mapping) else []
+    try:
+        run_id = int(run.get("id") or 0)
+    except (TypeError, ValueError):
+        run_id = 0
+    problem = run.get("review_receipt_problem") or "reviewed-head-missing"
+    invalid = run.get("review_receipt_invalid_keys")
+    detail = (
+        f"run={run_id}; "
+        f"profile={run.get('profile') or '-'}; "
+        f"keys={','.join(str(key) for key in keys) or '-'}; "
+        f"problem={problem}; "
+        "missing=reviewed_head"
+    )
+    if invalid:
+        detail += f"; invalid_keys={','.join(str(key) for key in invalid)}"
+    return detail
+
+
+def _dropped_review_receipt(
+    runs: Sequence[Mapping[str, Any]],
+    kept_ids: set[int],
+    config: LaneConfig,
+) -> str | None:
+    """The newest reviewer attempt that ``review_runs()`` did not return.
+
+    A run counts as a reviewer attempt when its profile is the configured
+    reviewer or its metadata carries a receipt key.  Only the newest attempt is
+    considered: an older crashed attempt must not block a later valid review,
+    but a dropped *latest* review must never disappear silently.
+    """
+
+    reviewer = config.review_options().reviewer
+    candidates: list[Mapping[str, Any]] = []
+    for run in runs:
+        metadata = run.get("metadata")
+        keys = set(metadata) if isinstance(metadata, Mapping) else set()
+        if run.get("profile") == reviewer or REVIEW_RECEIPT_KEYS.intersection(keys):
+            candidates.append(run)
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda run: int(run.get("id") or 0))
+    if int(latest.get("id") or 0) in kept_ids:
+        return None
+    return _review_receipt_detail(latest)
+
+
 def queue_release_cards(
     work_root: str | os.PathLike[str],
     adapter: BoardAdapter,
@@ -758,20 +871,48 @@ def queue_release_cards(
         row = adapter.task_row(task_id)
         if row is None or row.get("status") != "done":
             continue
-        runs = adapter.run_rows(task_id)
-        reviews = adapter.review_runs(task_id)
+        try:
+            runs = adapter.run_rows(task_id)
+            reviews = adapter.review_runs(task_id)
+        except Exception as exc:  # noqa: BLE001 - one card must not kill the tick
+            # A malformed row on one card is visible and local: name the card
+            # and keep processing the rest of the board.
+            queued.append(
+                _snapshot_skip(
+                    task_id,
+                    f"review-receipt-unreadable:{task_id}",
+                    f"{type(exc).__name__}: {exc}",
+                )
+            )
+            continue
+        kept_ids = {
+            int(run.get("id") or 0)
+            for run in reviews
+            if isinstance(run, Mapping)
+        }
+        dropped = _dropped_review_receipt(runs, kept_ids, config)
+        if dropped is not None:
+            # A review round existed but its receipt carried no key HKL could
+            # map to a reviewed commit: name it instead of dropping the card.
+            queued.append(_review_receipt_skip(task_id, dropped))
+            continue
         if not reviews:
             continue
         latest = max(reviews, key=lambda run: int(run.get("id") or 0))
+        if latest.get("review_receipt_problem") in (
+            "reviewed-head-missing",
+            "reviewed-head-invalid",
+        ):
+            queued.append(
+                _review_receipt_skip(task_id, _review_receipt_detail(latest))
+            )
+            continue
         raw_metadata = latest.get("metadata")
         raw_metadata = (
             raw_metadata if isinstance(raw_metadata, Mapping) else {}
         )
-        if (
-            "reviewed_head" in raw_metadata
-            or "reviewed_commit" in raw_metadata
-            or "verdict" in raw_metadata
-        ):
+        normalised: dict[str, Any] | None = None
+        if REVIEW_RECEIPT_KEYS.intersection(raw_metadata):
             normalised = _review_release_metadata(
                 root,
                 task_id,
@@ -779,6 +920,14 @@ def queue_release_cards(
                 config=config,
                 requirement_id=requirement_id,
             )
+            if normalised["problem"] in (
+                "reviewed-head-missing",
+                "reviewed-head-invalid",
+            ):
+                queued.append(
+                    _review_receipt_skip(task_id, _review_receipt_detail(latest))
+                )
+                continue
             if normalised["problem"] is not None:
                 # Never guess: the missing field is visible in the queue report.
                 queued.append(
@@ -878,6 +1027,16 @@ def queue_release_cards(
             executor_profile=dev_card.executor,
         )
         if evaluation.problems or evaluation.binding is None:
+            # Never skip silently: a reviewed card that cannot bind must show
+            # up in the queue report with the first concrete problem.
+            detail = (
+                evaluation.problems[0]
+                if evaluation.problems
+                else "binding-missing"
+            )
+            queued.append(
+                _snapshot_skip(task_id, INCOMPLETE_REVIEW_METADATA, detail)
+            )
             continue
         binding = evaluation.binding
         key = _merge_idempotency_key(task_id, binding)
@@ -936,23 +1095,207 @@ def queue_release_cards(
             # D9/§6.1: a card that fails read-back is not a completed handover;
             # surface the failure to the tick instead of reporting success.
             raise RuntimeError(";".join(problems))
-        queued.append(
-            {
-                "merge_task_id": merge_task_id,
-                "dev_task_id": task_id,
-                "idempotency_key": key,
-                "reviewed_head": binding.reviewed_head,
-                "evidence_index_sha256": binding.evidence_index_sha256,
-                "status": merge_row.get("status") if merge_row else None,
-                "assignee": merge_row.get("assignee") if merge_row else None,
-            }
-        )
+        queued_entry: dict[str, Any] = {
+            "merge_task_id": merge_task_id,
+            "dev_task_id": task_id,
+            "idempotency_key": key,
+            "reviewed_head": binding.reviewed_head,
+            "evidence_index_sha256": binding.evidence_index_sha256,
+            "status": merge_row.get("status") if merge_row else None,
+            "assignee": merge_row.get("assignee") if merge_row else None,
+        }
+        # Keep the mapping auditable: the queue report says which drifted key
+        # supplied the normalised fact.
+        alias_audit = list(latest.get("review_receipt_aliases") or [])
+        for alias in (normalised or {}).get("aliases") or []:
+            if alias not in alias_audit:
+                alias_audit.append(alias)
+        if alias_audit:
+            queued_entry["review_receipt_aliases"] = [
+                alias
+                if str(alias).startswith("review-receipt-alias:")
+                else f"review-receipt-alias:{alias}"
+                for alias in alias_audit
+            ]
+        queued.append(queued_entry)
     return queued
 
 
 # ---------------------------------------------------------------------------
 # 3. release_once
 # ---------------------------------------------------------------------------
+
+
+def _notify_error_report(
+    run_dir: Path,
+    *,
+    merge_sha: str,
+    error: str,
+    requirement_id: str,
+    merge_task_id: str,
+    dev_task_id: str,
+) -> None:
+    """Best-effort ``notify/report.json`` for an unexpected notify failure.
+
+    Writing it keeps the ``merge_sha`` idempotency key durable even when the
+    hook itself raised, so a resumed release does not notify twice.
+    """
+
+    try:
+        target = notify_report_path(run_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        document = {
+            "schema_version": 1,
+            "requirement_id": requirement_id,
+            "merge_task_id": merge_task_id,
+            "dev_task_id": dev_task_id,
+            "merge_sha": merge_sha,
+            "commands": [],
+            "verdict": "fail",
+            "reasons": [error],
+            "notified": True,
+        }
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+    except OSError:
+        pass
+
+
+def _log_notify_failure(
+    root: Path,
+    *,
+    merge_task_id: str,
+    merge_sha: str,
+    reasons: Sequence[str],
+) -> None:
+    """Append one warning line to the daemon log (never raises)."""
+
+    record = {
+        "record": "release-notify",
+        "merge_task_id": merge_task_id,
+        "merge_sha": merge_sha,
+        "verdict": "fail",
+        "reasons": list(reasons),
+    }
+    try:
+        logs = root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / "daemon.log", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _notify_release(
+    *,
+    root: Path,
+    adapter: BoardAdapter,
+    repo: str | os.PathLike[str],
+    run_dir: Path,
+    merge_sha: str,
+    merge_tree: str | None,
+    merge_config: Any,
+    requirement_id: str,
+    merge_task_id: str,
+    dev_task_id: str,
+    reviewed_head: str,
+    reviewed_tree: str | None,
+    main_before: str,
+    evidence_index_sha256: str | None,
+    authorization_source: str,
+) -> dict[str, Any]:
+    """Run the optional notify hook.  Failures are recorded, never re-raised."""
+
+    commands = getattr(merge_config, "notify_commands", ())
+    if not commands:
+        return {
+            "verdict": "skipped",
+            "reasons": ["notify-disabled"],
+            "notified": False,
+            "merge_sha": merge_sha,
+        }
+    try:
+        result = run_merge_notify(
+            repo=repo,
+            run_dir=run_dir,
+            merge_sha=merge_sha,
+            merge_tree=merge_tree,
+            commands=commands,
+            timeout_seconds=float(merge_config.notify_timeout_seconds),
+            requirement_id=requirement_id,
+            board=getattr(adapter, "name", "board"),
+            merge_task_id=merge_task_id,
+            dev_task_id=dev_task_id,
+            reviewed_head=reviewed_head,
+            reviewed_tree=reviewed_tree,
+            main_before=main_before,
+            evidence_index_sha256=evidence_index_sha256,
+            authorization_source=authorization_source,
+        )
+    except Exception as exc:  # noqa: BLE001 - a hook must not undo a merge
+        reason = f"notify-error:{type(exc).__name__}"
+        _notify_error_report(
+            run_dir,
+            merge_sha=merge_sha,
+            error=reason,
+            requirement_id=requirement_id,
+            merge_task_id=merge_task_id,
+            dev_task_id=dev_task_id,
+        )
+        result = {
+            "verdict": "fail",
+            "reasons": [reason],
+            "notified": False,
+            "merge_sha": merge_sha,
+            "commands": [],
+        }
+    if result.get("verdict") == "fail":
+        _log_notify_failure(
+            root,
+            merge_task_id=merge_task_id,
+            merge_sha=merge_sha,
+            reasons=result.get("reasons") or ["notify-failed"],
+        )
+    return result
+
+
+def _notify_facts_from_run_dir(
+    run_dir: Path, state: ReleaseState
+) -> dict[str, Any] | None:
+    """Recover notify facts from the run's own journals (recovery path)."""
+
+    try:
+        merge_document = json.loads(
+            (run_dir / "merge.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        merge_document = {}
+    try:
+        release_report = json.loads(
+            (run_dir / "release-report.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        release_report = {}
+    if not isinstance(merge_document, dict):
+        merge_document = {}
+    if not isinstance(release_report, dict):
+        release_report = {}
+    authorization = release_report.get("authorization")
+    if not isinstance(authorization, dict):
+        authorization = {}
+    return {
+        "merge_tree": state.merge_tree or merge_document.get("merge_tree"),
+        "reviewed_head": state.reviewed_head
+        or merge_document.get("reviewed_head"),
+        "reviewed_tree": release_report.get("reviewed_tree"),
+        "main_before": state.main_before or merge_document.get("main_before"),
+        "evidence_index_sha256": release_report.get("evidence_index_sha256"),
+        "authorization_source": authorization.get("source") or "file",
+    }
 
 
 def _release_reason_kind(reasons: Sequence[str], *, default: str = "needs_input") -> str:
@@ -962,6 +1305,150 @@ def _release_reason_kind(reasons: Sequence[str], *, default: str = "needs_input"
         if reason.startswith(("workspace-", "main-unresolved")):
             return "capability"
     return default
+
+
+def _finalise_release_report(
+    run_dir: Path,
+    *,
+    main_before: str | None,
+    merge_sha: str | None,
+    merge_tree: str | None,
+    merge_verdict: str | None,
+    merge_reasons: Sequence[str],
+    merged: bool,
+    postmerge: Mapping[str, Any] | None,
+) -> str:
+    """Add the merge/post-merge facts to ``release-report.json``.
+
+    The gate writes the report before anything moves; it cannot know the merge
+    commit or the regression result.  Leaving that file untouched made the same
+    run publish ``release-ready + reasons=[]`` next to ``merge.json: refused``.
+    Here the report is rewritten with the real ``merge_sha``/``merge_tree``/
+    ``postmerge`` and a single ``release_verdict`` for the release as a whole.
+
+    ``verdict`` keeps exactly one meaning: the gate verdict (W4-01).  It is
+    never rewritten here, for a scope refusal or any other.  The authoritative
+    final outcome is ``release_verdict``; ``reasons`` always carries every
+    refusal reason, so a report can never claim a clean release while a merge
+    was refused.
+    """
+
+    path = run_dir / RELEASE_REPORT_FILENAME
+    document = _read_json(path)
+    report = dict(document) if isinstance(document, dict) else {}
+    merge_document = _read_json(run_dir / "merge.json")
+    if not isinstance(merge_document, dict):
+        merge_document = {}
+
+    reasons = list(report.get("reasons") or [])
+    for reason in merge_reasons:
+        if reason not in reasons:
+            reasons.append(reason)
+    postmerge_reasons = (
+        list(postmerge.get("reasons") or []) if isinstance(postmerge, Mapping) else []
+    )
+    for reason in postmerge_reasons:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if merged:
+        if postmerge is not None:
+            final_verdict = (
+                "merged"
+                if postmerge.get("verdict") == "pass"
+                else "merged-with-failures"
+            )
+        else:
+            # A merge recorded before a later failure (assertion, lost claim)
+            # is still "merged + follow-up failure", never a clean release.
+            final_verdict = (
+                "merged"
+                if merge_verdict == "merged" and not merge_reasons
+                else "merged-with-failures"
+            )
+    elif merge_verdict == "refused":
+        final_verdict = "refused"
+    else:
+        final_verdict = report.get("verdict")
+
+    # ``verdict`` is the gate's verdict and stays that verdict.  Rewriting it
+    # for one reason family only (the old scope_refusal branch) gave the same
+    # field two contracts and left ``release-ready`` next to ``refused`` for
+    # every other pre-merge refusal.  The release outcome is one key:
+    # ``release_verdict``, backed by ``reasons``/``merged``/``merge_sha``.
+
+    report.update(
+        {
+            "release_verdict": final_verdict,
+            "reasons": reasons,
+            "merged": bool(merged),
+            "merge_sha": merge_sha,
+            "merge_tree": merge_tree,
+            "postmerge": dict(postmerge) if postmerge is not None else None,
+            "merge": {
+                "verdict": merge_verdict,
+                "reasons": list(merge_reasons),
+                "merged": bool(merged),
+                "main_before": main_before,
+                "merge_sha": merge_sha,
+                "merge_tree": merge_tree,
+                "changed_paths": list(merge_document.get("changed_paths") or []),
+                "outside_allow": merge_document.get("outside_allow", 0),
+                "outside_allow_paths": list(
+                    merge_document.get("outside_allow_paths") or []
+                ),
+                "protected_roots_touched": merge_document.get(
+                    "protected_roots_touched", 0
+                ),
+                "protected_root_paths": list(
+                    merge_document.get("protected_root_paths") or []
+                ),
+            },
+        }
+    )
+    _write_json(path, report)
+    return sha256_file(path)
+
+
+def _record_main_reading(
+    adapter: BoardAdapter,
+    task_id: str,
+    *,
+    main_before: str | None,
+    main_after: str | None,
+    merged: bool,
+    merge_sha: str | None,
+    reasons: Sequence[str],
+) -> None:
+    """Leave a verifiable "what happened to main" reading on the card.
+
+    The block reason stays the first named refusal reason; this event carries
+    the before/after commits so an operator can re-check the claim with
+    ``git rev-parse`` instead of trusting the card text.
+    """
+
+    unchanged = main_before is not None and main_before == main_after
+    payload = {
+        "main_before": main_before,
+        "main_after": main_after,
+        "unchanged": unchanged,
+        "merged": bool(merged),
+        "merge_sha": merge_sha,
+        "reasons": list(reasons),
+    }
+    try:
+        adapter.record_event_once(
+            task_id,
+            "release-main-reading",
+            reason=(
+                f"main-unchanged:{str(main_after)[:12]}"
+                if unchanged
+                else f"main-moved:{str(main_after)[:12]}"
+            ),
+            detail=json.dumps(payload, sort_keys=True),
+        )
+    except Exception:  # noqa: BLE001 - a reading must not change the outcome
+        return
 
 
 def _owns(adapter: BoardAdapter, identity: RunIdentity) -> bool:
@@ -1064,14 +1551,31 @@ def release_once(
         outcome["terminal_ok"] = _blocked(adapter, identity, reason, "needs_input")
         return outcome
     latest = max(reviews, key=lambda run: int(run.get("id") or 0))
-    metadata = latest.get("metadata") or {}
-    dev_run_id = metadata.get("dev_run_id")
-    if not isinstance(dev_run_id, int):
+    # Native reviewer runs do not write ``dev_run_id``/``evidence_index_sha256``
+    # themselves: those are derived from the development run index exactly as
+    # ``queue_release_cards`` does.  Reading the raw document here made a card
+    # that queued successfully block on every execution.  A derivation that
+    # cannot be made unambiguously carries its own named reason; never collapse
+    # those into ``review-dev-run-invalid`` (which points at the wrong field).
+    normalised = _review_release_metadata(
+        root,
+        dev_task_id,
+        latest,
+        config=config,
+        requirement_id=requirement_id,
+    )
+    reason = normalised["reason"]
+    dev_run_id = normalised["dev_run_id"]
+    if reason is None and not isinstance(dev_run_id, int):
+        # Defensive: a normalised document with no problem always carries a
+        # derived positive integer run id.
         reason = "review-dev-run-invalid"
+    if reason is not None:
         _terminal_state(state, run_dir)
         outcome.update(action="block", reason=reason)
         outcome["terminal_ok"] = _blocked(adapter, identity, reason, "needs_input")
         return outcome
+    metadata = normalised["metadata"]
     dev_dir, _ = _find_dev_run(root, dev_task_id, dev_run_id)
     if dev_dir is None or dev_row is None:
         reason = "rework-base-missing"
@@ -1087,10 +1591,32 @@ def release_once(
     changes_events = adapter.changes_requested_events(dev_task_id)
     previous_code = _previous_dev_code_commit(root, dev_task_id, dev_run_id)
 
+    # ``evaluate_binding`` must see the same derived fields the queue used to
+    # create this card.  Normalise every review run in the sequence it selects
+    # from without touching the development run rows.
+    evaluation_runs = list(runs)
+    known_ids = {
+        int(run.get("id") or 0)
+        for run in runs
+        if isinstance(run, Mapping)
+    }
+    for review in reviews:
+        if not isinstance(review, Mapping):
+            continue
+        if int(review.get("id") or 0) not in known_ids:
+            evaluation_runs.append(review)
+    evaluation_runs = _normalise_review_runs(
+        root,
+        dev_task_id,
+        evaluation_runs,
+        config=config,
+        requirement_id=requirement_id,
+    )
+
     decision = release_preflight(
         identity=identity,
         task_row=dev_row,
-        runs=runs,
+        runs=evaluation_runs,
         dev_run_dir=dev_dir,
         repo=repo,
         package_dir=package_root,
@@ -1104,6 +1630,10 @@ def release_once(
         executor_profile=dev_card.executor,
         changes_events=changes_events,
         previous_code_commit=previous_code,
+        authorization_mode=merge_config.authorization,
+        require_authorization_paths=merge_config.require_authorization_paths,
+        authorization_window_seconds=merge_config.authorization_window_seconds,
+        card_risk=dev_card.risk,
     )
     report_sha = sha256_file(Path(decision.report_path))
     outcome["release_report_sha256"] = report_sha
@@ -1175,8 +1705,11 @@ def release_once(
                 requirement_id=requirement_id,
                 timeout=MERGE_TIMEOUT,
             )
-            # ④ the merge journal, still inside the transaction.
-            if merge.ok:
+            # ④ the merge journal, still inside the transaction.  ``ok`` also
+            # requires every assertion to hold; ``merged`` is the git fact.
+            # Journal a merge commit even when a post-merge assertion failed,
+            # so recovery can never merge the same pair twice.
+            if merge.merged:
                 state.advance(
                     "merged",
                     merge_sha=merge.merge_sha,
@@ -1195,23 +1728,60 @@ def release_once(
     outcome["merge_reasons"] = list(merge.reasons)
     if not merge.ok:
         reason = merge.reasons[0] if merge.reasons else "merge-failed"
-        _terminal_state(
-            state, run_dir, release_report_sha256=report_sha
+        # The report must describe what git actually did.  A pre-merge refusal
+        # carries ``merge_sha: null``; a post-merge assertion failure carries
+        # the real commit and ``merged: true`` -- never ``refused``.
+        report_sha = _finalise_release_report(
+            run_dir,
+            main_before=main_before,
+            merge_sha=merge.merge_sha,
+            merge_tree=merge.merge_tree,
+            merge_verdict=merge.document.get("verdict"),
+            merge_reasons=merge.reasons,
+            merged=merge.merged,
+            postmerge=None,
         )
+        try:
+            main_after = repo_head(repo)
+        except GitError:
+            main_after = None
+        _record_main_reading(
+            adapter,
+            identity.task_id,
+            main_before=main_before,
+            main_after=main_after,
+            merged=merge.merged,
+            merge_sha=merge.merge_sha,
+            reasons=merge.reasons,
+        )
+        _terminal_state(state, run_dir, release_report_sha256=report_sha)
         kind = _release_reason_kind(merge.reasons)
         outcome.update(action="block", reason=reason)
+        outcome["release_report_sha256"] = report_sha
         outcome["terminal_ok"] = _blocked(adapter, identity, reason, kind)
         return outcome
 
     outcome["merge_sha"] = merge.merge_sha
     outcome["merge_tree"] = merge.merge_tree
+    outcome["release_report_sha256"] = report_sha
 
     # D9-I §6.3 step 4: after the fence, heartbeat and re-read the claim.  A
     # stale run must not run post-merge commands or complete the merge card;
     # the occurred merge is recorded and left to an operator.
     _heartbeat(adapter, identity)
     if not _owns(adapter, identity):
+        report_sha = _finalise_release_report(
+            run_dir,
+            main_before=main_before,
+            merge_sha=merge.merge_sha,
+            merge_tree=merge.merge_tree,
+            merge_verdict=merge.document.get("verdict"),
+            merge_reasons=(*merge.reasons, "stale_run"),
+            merged=merge.merged,
+            postmerge=None,
+        )
         _terminal_state(state, run_dir, release_report_sha256=report_sha)
+        outcome["release_report_sha256"] = report_sha
         outcome.update(action="stale_run", reason="stale_run")
         outcome["terminal_ok"] = False
         return outcome
@@ -1235,12 +1805,38 @@ def release_once(
     write_release_state(run_dir, state)
     outcome["postmerge_report_sha256"] = postmerge_sha
     outcome["postmerge"] = postmerge
+    # Record the regression result next to the merge facts.  A failing
+    # post-merge command leaves ``merged: true`` plus the regression reasons;
+    # it never turns an already-merged release into ``refused``.
+    report_sha = _finalise_release_report(
+        run_dir,
+        main_before=main_before,
+        merge_sha=merge.merge_sha,
+        merge_tree=merge.merge_tree,
+        merge_verdict=merge.document.get("verdict"),
+        merge_reasons=merge.reasons,
+        merged=merge.merged,
+        postmerge=postmerge,
+    )
+    outcome["release_report_sha256"] = report_sha
 
     if postmerge.get("verdict") != "pass":
         reasons = postmerge.get("reasons") or ["postmerge-failed"]
         reason = reasons[0]
+        _record_main_reading(
+            adapter,
+            identity.task_id,
+            main_before=main_before,
+            main_after=merge.merge_sha,
+            merged=merge.merged,
+            merge_sha=merge.merge_sha,
+            reasons=reasons,
+        )
         _terminal_state(
-            state, run_dir, postmerge_report_sha256=postmerge_sha
+            state,
+            run_dir,
+            release_report_sha256=report_sha,
+            postmerge_report_sha256=postmerge_sha,
         )
         outcome.update(action="block", reason=reason)
         outcome["terminal_ok"] = _blocked(adapter, identity, reason, "needs_input")
@@ -1271,6 +1867,29 @@ def release_once(
             }
         },
     )
+    # The optional notify hook runs only after the merge card is done.  It is
+    # ops configuration (not card/model output); a failure is recorded but
+    # never reopens the card or rolls the merge back.
+    if completed:
+        outcome["notify"] = _notify_release(
+            root=root,
+            adapter=adapter,
+            repo=repo,
+            run_dir=run_dir,
+            merge_sha=merge.merge_sha or "",
+            merge_tree=merge.merge_tree,
+            merge_config=merge_config,
+            requirement_id=requirement_id,
+            merge_task_id=identity.task_id,
+            dev_task_id=dev_task_id,
+            reviewed_head=binding.reviewed_head,
+            reviewed_tree=binding.reviewed_tree,
+            main_before=main_before,
+            evidence_index_sha256=binding.evidence_index_sha256,
+            authorization_source=(
+                decision.report.get("authorization", {}).get("source") or "file"
+            ),
+        )
     _terminal_state(
         state,
         run_dir,
@@ -1295,6 +1914,19 @@ def _release_card_for(
 ) -> CardSpec | None:
     _, card = _load_card(root, config, task_id)
     return card
+
+
+def _release_repo_path(
+    config: LaneConfig, root: Path, merge_task_id: str
+) -> str:
+    """The merged repository for a release card, or the work root if unknown."""
+
+    card = _release_card_for(root, config, merge_task_id)
+    if card is not None:
+        repository = config.repositories.get(card.repository)
+        if repository is not None:
+            return repository.path
+    return str(root)
 
 
 def _commit_parents(repo: str | os.PathLike[str], commit: str) -> list[str]:
@@ -1404,7 +2036,53 @@ def recover_releases(
             }
             row = adapter.task_row(state.merge_task_id)
             if row is None or row.get("status") != "running":
-                entry["action"] = "not-running"
+                if (
+                    row is not None
+                    and row.get("status") == "done"
+                    and state.stage == "postmerge"
+                ):
+                    # The card was completed before the crash but the journal
+                    # never reached ``terminal``.  Finish the journal and, if
+                    # the notify hook never ran, run it once (keyed on
+                    # ``merge_sha``) without any board write.
+                    if (
+                        merge_config.notify_commands
+                        and state.merge_sha
+                        and not merge_notification_sent(
+                            run_path, state.merge_sha
+                        )
+                    ):
+                        facts = _notify_facts_from_run_dir(run_path, state) or {}
+                        entry["notify"] = _notify_release(
+                            root=root,
+                            adapter=adapter,
+                            repo=_release_repo_path(
+                                config, root, state.merge_task_id
+                            ),
+                            run_dir=run_path,
+                            merge_sha=state.merge_sha,
+                            merge_tree=state.merge_tree,
+                            merge_config=merge_config,
+                            requirement_id=requirement_id,
+                            merge_task_id=state.merge_task_id,
+                            dev_task_id=state.dev_task_id,
+                            reviewed_head=facts.get("reviewed_head") or "",
+                            reviewed_tree=facts.get("reviewed_tree"),
+                            main_before=facts.get("main_before") or "",
+                            evidence_index_sha256=facts.get(
+                                "evidence_index_sha256"
+                            ),
+                            authorization_source=facts.get("authorization_source")
+                            or "file",
+                        )
+                    _terminal_state(
+                        state,
+                        run_path,
+                        postmerge_report_sha256=state.postmerge_report_sha256,
+                    )
+                    entry["action"] = "completed-already"
+                else:
+                    entry["action"] = "not-running"
                 recovered.append(entry)
                 continue
             if adapter.identity(state.merge_task_id) != state.identity:
@@ -1490,6 +2168,48 @@ def recover_releases(
                     requirement_id=requirement_id,
                 )
                 if not record.ok:
+                    if record.merged:
+                        # The merge commit exists; its post-merge assertions
+                        # failed.  Record "merged + follow-up failure" with the
+                        # real merge_sha instead of a second merge or a
+                        # ``refused`` that hides the moved branch.
+                        state.advance(
+                            "merged",
+                            main_before=intent.main_before,
+                            reviewed_head=intent.reviewed_head,
+                            merge_sha=record.merge_sha,
+                            merge_tree=record.merge_tree,
+                        )
+                        write_release_state(run_path, state)
+                        reason = record.reasons[0] if record.reasons else "merge-failed"
+                        release_report_sha = _finalise_release_report(
+                            run_path,
+                            main_before=intent.main_before,
+                            merge_sha=record.merge_sha,
+                            merge_tree=record.merge_tree,
+                            merge_verdict=record.document.get("verdict"),
+                            merge_reasons=record.reasons,
+                            merged=True,
+                            postmerge=None,
+                        )
+                        _record_main_reading(
+                            adapter,
+                            state.merge_task_id,
+                            main_before=intent.main_before,
+                            main_after=record.merge_sha,
+                            merged=True,
+                            merge_sha=record.merge_sha,
+                            reasons=record.reasons,
+                        )
+                        _terminal_state(
+                            state,
+                            run_path,
+                            release_report_sha256=release_report_sha,
+                        )
+                        entry["action"] = f"blocked:{reason}"
+                        _blocked(adapter, state.identity, reason, "needs_input")
+                        recovered.append(entry)
+                        continue
                     _terminal_state(state, run_path)
                     entry["action"] = "blocked:release-diverged"
                     _blocked(
@@ -1545,11 +2265,35 @@ def recover_releases(
             if state.stage != "postmerge":
                 state.advance("postmerge", postmerge_report_sha256=postmerge_sha)
             write_release_state(run_path, state)
+            recovered_facts = _notify_facts_from_run_dir(run_path, state) or {}
+            release_report_sha = _finalise_release_report(
+                run_path,
+                main_before=recovered_facts.get("main_before") or state.main_before,
+                merge_sha=state.merge_sha,
+                merge_tree=state.merge_tree,
+                merge_verdict="merged",
+                merge_reasons=(),
+                merged=True,
+                postmerge=postmerge,
+            )
             if postmerge.get("verdict") != "pass":
                 reasons = postmerge.get("reasons") or ["postmerge-failed"]
                 reason = reasons[0]
+                _record_main_reading(
+                    adapter,
+                    state.merge_task_id,
+                    main_before=recovered_facts.get("main_before")
+                    or state.main_before,
+                    main_after=state.merge_sha,
+                    merged=True,
+                    merge_sha=state.merge_sha,
+                    reasons=reasons,
+                )
                 _terminal_state(
-                    state, run_path, postmerge_report_sha256=postmerge_sha
+                    state,
+                    run_path,
+                    release_report_sha256=release_report_sha,
+                    postmerge_report_sha256=postmerge_sha,
                 )
                 entry["action"] = f"blocked:{reason}"
                 _blocked(adapter, state.identity, reason, "needs_input")
@@ -1566,13 +2310,40 @@ def recover_releases(
                         "dev_task_id": state.dev_task_id,
                         "merge_sha": state.merge_sha,
                         "merge_tree": state.merge_tree,
+                        "release_report_sha256": release_report_sha,
                         "postmerge_report_sha256": postmerge_sha,
                         "recovered": True,
                     }
                 },
             )
+            # Resume the notify hook only after the card is complete, and key
+            # it on ``merge_sha`` so a resumed release never notifies twice.
+            if completed and not merge_notification_sent(
+                run_path, state.merge_sha
+            ):
+                facts = _notify_facts_from_run_dir(run_path, state) or {}
+                entry["notify"] = _notify_release(
+                    root=root,
+                    adapter=adapter,
+                    repo=repo,
+                    run_dir=run_path,
+                    merge_sha=state.merge_sha,
+                    merge_tree=state.merge_tree,
+                    merge_config=merge_config,
+                    requirement_id=requirement_id,
+                    merge_task_id=state.merge_task_id,
+                    dev_task_id=state.dev_task_id,
+                    reviewed_head=facts.get("reviewed_head") or "",
+                    reviewed_tree=facts.get("reviewed_tree"),
+                    main_before=facts.get("main_before") or "",
+                    evidence_index_sha256=facts.get("evidence_index_sha256"),
+                    authorization_source=facts.get("authorization_source") or "file",
+                )
             _terminal_state(
-                state, run_path, postmerge_report_sha256=postmerge_sha
+                state,
+                run_path,
+                release_report_sha256=release_report_sha,
+                postmerge_report_sha256=postmerge_sha,
             )
             entry["action"] = "completed" if completed else "stale_run"
             recovered.append(entry)

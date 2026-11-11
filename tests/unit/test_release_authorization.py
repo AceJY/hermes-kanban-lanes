@@ -10,8 +10,10 @@ import pytest
 from hermes_kanban_lanes.release.authorization import (
     AUTHORIZATION_FIELDS,
     AUTHORIZATION_SCHEMA_VERSION,
+    POLICY_APPROVER,
     ReleaseAuthorization,
     authorization_problems,
+    build_policy_authorization,
     load_authorization,
 )
 from hermes_kanban_lanes.verification.evidence import sha256_file
@@ -238,3 +240,67 @@ def test_expected_none_fields_are_not_compared(tmp_path):
     authorization, _ = load_authorization(_write(tmp_path, _document()))
     expected = {key: None for key in _expected()}
     assert authorization_problems(authorization, expected, now=1_500) == []
+
+
+# ---------------------------------------------------------------------------
+# Policy authorization (owner decision 2026-11-11)
+# ---------------------------------------------------------------------------
+
+
+def test_file_mode_rejects_a_forged_policy_approver(tmp_path):
+    path = _write(tmp_path, _document(approver=POLICY_APPROVER))
+    authorization, problems = load_authorization(path)
+    # Shape validation accepts the string; the approval check is what refuses.
+    assert problems == []
+    assert authorization is not None
+    assert "authorization-policy-approver-forbidden" in authorization_problems(
+        authorization, _expected(), now=1_500
+    )
+    # Only a policy-synthesized record may carry the reserved identity.
+    assert authorization_problems(
+        authorization,
+        _expected(),
+        now=1_500,
+        allow_policy_approver=True,
+    ) == []
+
+
+def test_policy_source_field_is_optional_but_validated(tmp_path):
+    path = _write(tmp_path, _document(source="policy"))
+    authorization, problems = load_authorization(path)
+    assert problems == []
+    assert authorization is not None
+    assert authorization.source == "policy"
+    assert authorization.to_dict()["source"] == "policy"
+
+    bad = _write(tmp_path, _document(source="human"), name="bad.json")
+    authorization, problems = load_authorization(bad)
+    assert authorization is None
+    assert "authorization-field-invalid:source" in problems
+
+
+def test_build_policy_authorization_binds_every_reviewed_field():
+    expected = {**_expected(), "main_ref": "refs/heads/main"}
+    authorization = build_policy_authorization(
+        expected, approved_at=1_500, expires_at=2_400
+    )
+    assert authorization is not None
+    assert authorization.approver == POLICY_APPROVER
+    assert authorization.source == "policy"
+    assert authorization.approved_at == 1_500
+    assert authorization.expires_at == 2_400
+    assert authorization.path is None
+    assert authorization.sha256 is None
+    assert authorization_problems(
+        authorization,
+        expected,
+        now=1_500,
+        allow_policy_approver=True,
+    ) == []
+
+
+def test_build_policy_authorization_refuses_an_incomplete_binding():
+    expected = {**_expected(), "reviewed_head": None}
+    assert build_policy_authorization(
+        expected, approved_at=1_500, expires_at=2_400
+    ) is None

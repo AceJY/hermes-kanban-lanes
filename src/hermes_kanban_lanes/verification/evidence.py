@@ -493,9 +493,16 @@ def verify_evidence(
             base_ok = isinstance(base_commit, str) and is_ancestor(
                 base_commit, code_commit, repo=git_repo
             )
-            sync_ok = isinstance(sync_base, str) and is_ancestor(
-                sync_base, code_commit, repo=git_repo
-            )
+            if isinstance(base_commit, str) and code_commit == base_commit:
+                # A round that authored no commit has no post-sync commit for
+                # ``sync_base`` to be an ancestor of.  The supervisor names
+                # that shape (``rework-no-changes``) and blocks before evidence;
+                # here the check is simply not applicable, never tampering.
+                sync_ok = True
+            else:
+                sync_ok = isinstance(sync_base, str) and is_ancestor(
+                    sync_base, code_commit, repo=git_repo
+                )
         except GitError:
             base_ok = sync_ok = False
         if not base_ok:

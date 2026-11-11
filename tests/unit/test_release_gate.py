@@ -22,7 +22,7 @@ from hermes_kanban_lanes.config import (
     Repository,
     ReviewConfig,
 )
-from hermes_kanban_lanes.contracts import RunIdentity
+from hermes_kanban_lanes.contracts import ContractError, RunIdentity
 from hermes_kanban_lanes.runtime.release import _dev_cards, queue_release_cards
 from hermes_kanban_lanes.release.gate import (
     RELEASE_CHECKS,
@@ -735,6 +735,251 @@ class _QueueAdapter:
 
     def child_ids(self, task_id: str):
         return []
+
+
+# ---------------------------------------------------------------------------
+# Policy authorization (owner decision 2026-11-11)
+# ---------------------------------------------------------------------------
+
+
+def test_file_mode_rejects_a_forged_policy_approver(gate_facts):
+    _write_json(
+        gate_facts["authorization"],
+        _authorization(
+            base=gate_facts["base"],
+            head=gate_facts["head"],
+            tree=gate_facts["tree"],
+            index_sha=gate_facts["index_sha"],
+            approver="policy:auto",
+        ),
+    )
+    decision = _gate(gate_facts)
+    assert decision.verdict == "refused"
+    assert "authorization-policy-approver-forbidden" in decision.reasons
+    check = next(
+        c for c in _report(gate_facts)["checks"] if c["name"] == "authorization"
+    )
+    assert check["source"] == "file"
+
+
+def test_policy_mode_normal_card_generates_an_auditable_record(gate_facts, tmp_path):
+    absent = tmp_path / "authorizations" / "absent.json"
+    decision = _gate(
+        gate_facts,
+        authorization_path=absent,
+        authorization_mode="policy",
+        card_risk="normal",
+        authorization_window_seconds=900,
+    )
+    assert decision.verdict == "release-ready", decision.reasons
+    assert decision.reasons == ()
+
+    report = _report(gate_facts)
+    authorization = report["authorization"]
+    assert authorization["source"] == "policy"
+    assert authorization["approver"] == "policy:auto"
+    assert authorization["path"] == "authorization.json"
+    assert authorization["policy"]["generated"] is True
+    assert authorization["policy"]["high_risk"] is False
+
+    generated = Path(gate_facts["release_dir"]) / "authorization.json"
+    assert generated.is_file()
+    document = json.loads(generated.read_text(encoding="utf-8"))
+    assert document["source"] == "policy"
+    assert document["approver"] == "policy:auto"
+    assert document["expires_at"] - document["approved_at"] == 900
+    assert document["approved_at"] == 1_500
+    assert document["reviewed_head"] == gate_facts["head"]
+    assert document["reviewed_tree"] == gate_facts["tree"]
+    assert document["evidence_index_sha256"] == gate_facts["index_sha"]
+    assert document["main_commit"] == gate_facts["base"]
+    assert authorization["sha256"] == sha256_file(generated)
+
+
+def test_policy_mode_high_risk_requires_the_operator_authorization(gate_facts):
+    decision = _gate(
+        gate_facts,
+        authorization_path=gate_facts["authorization"].with_name("absent.json"),
+        authorization_mode="policy",
+        card_risk="high",
+    )
+    assert decision.verdict == "refused"
+    assert "authorization-required:high-risk" in decision.reasons
+    assert not (Path(gate_facts["release_dir"]) / "authorization.json").exists()
+
+    # The operator (main controller) writes the approval; the change releases.
+    _write_json(
+        gate_facts["authorization"],
+        _authorization(
+            base=gate_facts["base"],
+            head=gate_facts["head"],
+            tree=gate_facts["tree"],
+            index_sha=gate_facts["index_sha"],
+        ),
+    )
+    decision = _gate(
+        gate_facts,
+        authorization_mode="policy",
+        card_risk="high",
+    )
+    assert decision.verdict == "release-ready", decision.reasons
+    assert _report(gate_facts)["authorization"]["source"] == "file"
+
+
+def test_policy_mode_required_paths_force_the_operator_authorization(gate_facts):
+    decision = _gate(
+        gate_facts,
+        authorization_path=gate_facts["authorization"].with_name("absent.json"),
+        authorization_mode="policy",
+        require_authorization_paths=("RESULT.txt",),
+    )
+    assert decision.verdict == "refused"
+    assert "authorization-required:high-risk" in decision.reasons
+    assert "paths:RESULT.txt" in _report(gate_facts)["authorization"]["policy"][
+        "high_risk_reasons"
+    ]
+
+    # A prefix that does not cover any changed path stays on policy release.
+    decision = _gate(
+        gate_facts,
+        authorization_path=gate_facts["authorization"].with_name("absent.json"),
+        authorization_mode="policy",
+        require_authorization_paths=("docs/",),
+    )
+    assert decision.verdict == "release-ready", decision.reasons
+
+
+def test_policy_mode_does_not_bypass_binding_checks(gate_facts, tmp_path):
+    tampered = dict(gate_facts["metadata"])
+    tampered["verdict"] = "revise"
+    runs = [gate_facts["runs"][0], dict(gate_facts["runs"][1], metadata=tampered)]
+    decision = _gate(
+        gate_facts,
+        runs=runs,
+        authorization_path=tmp_path / "absent.json",
+        authorization_mode="policy",
+    )
+    assert decision.verdict == "refused"
+    assert "review-verdict-not-pass" in decision.reasons
+    assert "authorization-required:binding-unavailable" in decision.reasons
+    assert not (Path(gate_facts["release_dir"]) / "authorization.json").exists()
+
+
+def test_policy_mode_does_not_bypass_evidence_checks(gate_facts, tmp_path):
+    (Path(gate_facts["run_dir"]) / "evidence" / "manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    decision = _gate(
+        gate_facts,
+        authorization_path=tmp_path / "absent.json",
+        authorization_mode="policy",
+    )
+    assert decision.verdict == "refused"
+    assert any(
+        reason.startswith("evidence:") for reason in decision.reasons
+    ), decision.reasons
+    # A policy record may exist, but it never turns a failed check green.
+    assert _report(gate_facts)["verdict"] == "refused"
+
+
+def test_policy_mode_does_not_bypass_main_unchanged(gate_facts, tmp_path):
+    repo = gate_facts["repo"]
+    (repo / "MAIN.txt").write_text("moved\n", encoding="utf-8")
+    _git("add", "MAIN.txt", cwd=repo)
+    _git("commit", "-q", "-m", "main moved", cwd=repo)
+    decision = _gate(
+        gate_facts,
+        authorization_path=tmp_path / "absent.json",
+        authorization_mode="policy",
+    )
+    assert decision.verdict == "refused"
+    assert "main-moved" in decision.reasons
+
+
+# ---------------------------------------------------------------------------
+# Policy configuration (D11 additive keys)
+# ---------------------------------------------------------------------------
+
+
+def _policy_config_document(**merge_overrides):
+    merge = {
+        "enabled": True,
+        "main_ref": MAIN_REF,
+        "post_merge_commands": [["true"]],
+        "post_merge_timeout_seconds": 60,
+    }
+    merge.update(merge_overrides)
+    return {
+        "schema_version": 1,
+        "hermes_source": "/srv/hermes/source",
+        "hermes_commit": "a" * 40,
+        "boards": {"test": "/srv/hermes/kanban/test.db"},
+        "repositories": {
+            "primary": {"path": "/srv/hermes/repos/primary", "trusted": True}
+        },
+        "executors": {"claude": {"argv": ["claude"]}},
+        "work_root": "/srv/hermes/work",
+        "max_concurrent": 1,
+        "review": {
+            "reviewer": "code-reviewer",
+            "max_rework_rounds": 3,
+            "merge": merge,
+        },
+    }
+
+
+def test_policy_config_defaults_are_file_mode():
+    config = LaneConfig.from_dict(_policy_config_document())
+    assert config.review is not None
+    merge = config.review.merge
+    assert merge.authorization == "file"
+    assert merge.require_authorization_paths == ()
+    assert merge.authorization_window_seconds == 900
+    # Defaults stay omitted so an existing document round-trips unchanged.
+    assert config.to_dict() == _policy_config_document()
+
+
+def test_policy_config_parses_and_round_trips_its_keys():
+    document = _policy_config_document(
+        authorization="policy",
+        require_authorization_paths=["src/hermes_kanban_lanes/release/"],
+        authorization_window_seconds=42,
+    )
+    config = LaneConfig.from_dict(document)
+    assert config.review is not None
+    merge = config.review.merge
+    assert merge.authorization == "policy"
+    assert merge.require_authorization_paths == (
+        "src/hermes_kanban_lanes/release/",
+    )
+    assert merge.authorization_window_seconds == 42
+    assert config.to_dict() == document
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("authorization", "auto"),
+        ("authorization", "FILE"),
+        ("authorization", None),
+        ("require_authorization_paths", "src/"),
+        ("require_authorization_paths", [""]),
+        ("require_authorization_paths", ["/absolute/path"]),
+        ("require_authorization_paths", ["src/../escape"]),
+        ("authorization_window_seconds", 0),
+        ("authorization_window_seconds", True),
+        ("authorization_window_seconds", "900"),
+    ],
+)
+def test_policy_config_invalid_values_are_rejected(field, value):
+    with pytest.raises(ContractError):
+        LaneConfig.from_dict(_policy_config_document(**{field: value}))
+
+
+def test_policy_config_unknown_key_is_still_rejected():
+    with pytest.raises(ContractError) as excinfo:
+        LaneConfig.from_dict(_policy_config_document(push=True))
+    assert "push" in str(excinfo.value)
 
 
 def test_release_snapshot_missing_skips(tmp_path):

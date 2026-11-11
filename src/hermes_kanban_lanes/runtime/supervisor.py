@@ -45,6 +45,7 @@ from ..workspace.git import (
     create_run_worktree,
     current_branch,
     diff_paths,
+    is_ancestor,
     merge_commit,
     repo_head,
     run_git,
@@ -398,6 +399,12 @@ def rework_context(
     The round is ``changes_requested`` event count + 1.  Round 1 starts at the
     current main head; a rework round starts at the previous run's
     ``code_commit`` and keeps the round-1 base for the cumulative scope check.
+
+    A rework round also carries the reviewer's ``changes_requested`` text: the
+    round must be able to name what it is fixing (it is copied into ``run.json``
+    and the executor prompt).  A rework with no readable review input is refused
+    before any workspace or executor is created, so an empty round cannot spin
+    twice and then fail for an unrelated ancestry reason.
     """
 
     round_number = len(events) + 1
@@ -451,6 +458,25 @@ def rework_context(
         result["error_kind"] = "capability"
         return result
 
+    # The latest review hand-off is the input this round must act on.  It is
+    # deliberately read from the event payload rather than inferred from the
+    # card body: a rework without a readable request cannot be executed.
+    latest_event = events[-1] if events else {}
+    latest_reason = (
+        latest_event.get("reason") if isinstance(latest_event, Mapping) else None
+    )
+    if not isinstance(latest_reason, str) or not latest_reason.strip():
+        result["error"] = "rework-input-missing"
+        result["error_kind"] = "needs_input"
+        return result
+    requested = [
+        str(event.get("reason")).strip()
+        for event in events
+        if isinstance(event, Mapping)
+        and isinstance(event.get("reason"), str)
+        and str(event.get("reason")).strip()
+    ]
+
     if len(events) >= 2 and len(previous) >= 2:
         last_reason = events[-1].get("reason") if isinstance(events[-1], dict) else None
         prior_reason = events[-2].get("reason") if isinstance(events[-2], dict) else None
@@ -470,7 +496,18 @@ def rework_context(
 
     result["task_base_commit"] = task_base
     result["continuation_base"] = continuation
+    result["changes_requested"] = requested
+    result["changes_requested_summary"] = latest_reason.strip()
     return result
+
+
+def _rework_no_changes_reason(rework: Mapping[str, Any]) -> str:
+    """Name a rework round that authored no commit, with the requested fixes."""
+
+    summary = rework.get("changes_requested_summary")
+    if isinstance(summary, str) and summary.strip():
+        return f"rework-no-changes: {summary.strip()}"
+    return "rework-no-changes"
 
 
 def run_once(
@@ -530,6 +567,8 @@ def run_once(
     round_number = int(rework["round"])
     task_base_commit = str(rework["task_base_commit"])
     continuation_base = str(rework["continuation_base"])
+    rework_changes = list(rework.get("changes_requested") or [])
+    rework_summary = rework.get("changes_requested_summary")
 
     run_dir, workspace = allocate_run_paths(root, identity.task_id, identity.run_id)
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -647,6 +686,14 @@ def run_once(
         )
         write_json(run_dir / settings_filename, executor.settings_document())
         prompt = str(task.get("body") or task.get("title") or "")
+        if round_number > 1 and isinstance(rework_summary, str) and rework_summary:
+            # D4: the review hand-off is part of the executor input, not just
+            # board metadata.  Without it a rework round runs blind.
+            prompt = (
+                f"{prompt}\n\n"
+                f"Rework round {round_number}. The reviewer requested:\n"
+                f"{rework_summary}"
+            )
         argv = executor.build_argv(
             executor_cfg.argv,
             run_dir=str(run_dir),
@@ -803,12 +850,19 @@ def run_once(
         except GitError as exc:
             commit_error = str(exc)
             run_commit = None
+        no_op_round = bool(
+            category == "success"
+            and run_commit is not None
+            and run_commit == continuation_base
+        )
         if run_commit is not None:
             try:
+                # ``run_commit == continuation_base`` means this round authored
+                # nothing; do not report the previous round's diff as its own.
                 changed = (
-                    diff_paths(task_base_commit, run_commit, cwd=workspace)
-                    if run_commit != task_base_commit
-                    else []
+                    []
+                    if run_commit == continuation_base
+                    else diff_paths(task_base_commit, run_commit, cwd=workspace)
                 )
             except GitError:
                 changed = []
@@ -822,6 +876,12 @@ def run_once(
         if category == "success" and run_commit is None:
             category = "environment_failure"
             failure_reason = "commit-failed"
+        elif no_op_round and round_number > 1:
+            # D4: a rework round that authored no commit is named for what it
+            # is.  It must never fall through to the evidence ancestry check,
+            # where the advancing main tip would mislabel it as tampering.
+            category = "code_failure"
+            failure_reason = _rework_no_changes_reason(rework)
 
         # 7. baseline sync (D5) ------------------------------------------
         try:
@@ -829,12 +889,19 @@ def run_once(
         except GitError:
             sync_base = original_base
         baseline["sync_base"] = sync_base
-        baseline["updated"] = bool(
-            sync_base is not None and sync_base != original_base
-        )
         code_commit = run_commit
         merge_error: str | None = None
-        if category == "success" and run_commit is not None and sync_base != original_base:
+        needs_sync = False
+        if category == "success" and run_commit is not None and sync_base is not None:
+            # Merge the baseline when main moved during the run *or* when the
+            # rework branch was cut from an older commit.  After the merge
+            # ``sync_base`` is an ancestor of ``code_commit`` by construction.
+            needs_sync = bool(
+                sync_base != original_base
+                or not is_ancestor(sync_base, run_commit, repo=workspace)
+            )
+        baseline["updated"] = needs_sync
+        if category == "success" and run_commit is not None and needs_sync:
             merge = merge_commit(
                 workspace,
                 sync_base,
@@ -1116,6 +1183,10 @@ def run_once(
                 if gate_verdict is not None and gate_verdict != "pass"
                 else "code_failure"
             )
+            # Mirror the environment_failure branch: the outcome names the same
+            # reason the board was given, so a named refusal is never ``None``
+            # only in run metadata.
+            reason = block_reason
             terminal, terminal_ok = "block", adapter.block(
                 identity, block_reason, "needs_input"
             )
@@ -1240,6 +1311,11 @@ def run_once(
         "round": round_number,
         "task_base_commit": task_base_commit,
         "continuation_base": continuation_base,
+        "rework": {
+            "round": round_number,
+            "changes_requested": rework_changes,
+            "summary": rework_summary,
+        },
         "review": None,
         "baseline": baseline,
         "previous_runs": assessments,

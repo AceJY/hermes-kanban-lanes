@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -27,7 +28,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_NAME = "hermes_kanban_lanes"
 DIST_NAME = "hermes-kanban-lanes"
-WHEEL_VERSION = "0.2.0"
+# Single source of truth: the release version lives in pyproject.toml, so a
+# version bump never needs a second edit in this file.
+WHEEL_VERSION = tomllib.loads(
+    (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+)["project"]["version"]
 PUBLIC_EXPORT = REPO_ROOT / "tools" / "public_export.py"
 BUILD_WHEEL = REPO_ROOT / "tools" / "build_wheel.py"
 EXPORT_MANIFEST = "PUBLIC-EXPORT-MANIFEST.json"

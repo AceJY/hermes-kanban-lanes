@@ -21,12 +21,17 @@ from ..workspace.git import (
     GitError,
     changed_paths,
     current_branch,
+    diff_paths,
     merge_tree_preflight,
     resolve_ref,
 )
 from .authorization import (
+    AUTHORIZATION_SOURCE_FILE,
+    AUTHORIZATION_SOURCE_POLICY,
+    POLICY_AUTHORIZATION_FILENAME,
     ReleaseAuthorization,
     authorization_problems,
+    build_policy_authorization,
     load_authorization,
 )
 from .binding import (
@@ -90,6 +95,44 @@ def _run_relative_path(path: str | os.PathLike[str]) -> str:
     return (Path(target.parent.name) / target.name).as_posix()
 
 
+def _policy_high_risk_reasons(
+    card_risk: str | None,
+    binding: ReviewBinding | None,
+    repo: Path,
+    required_paths: Sequence[str],
+) -> list[str]:
+    """Why policy may not auto-authorize this change (empty means low risk).
+
+    Fail closed: a configured path prefix whose touched paths cannot be
+    computed keeps the change on the file/human approval path.
+    """
+
+    reasons: list[str] = []
+    if card_risk == "high":
+        reasons.append("risk:high")
+    if required_paths:
+        if binding is None:
+            reasons.append("changed-paths-unavailable")
+            return reasons
+        try:
+            touched = diff_paths(
+                binding.task_base_commit,
+                binding.reviewed_head,
+                cwd=repo,
+            )
+        except GitError:
+            reasons.append("changed-paths-unavailable")
+            return reasons
+        matched = [
+            path
+            for path in touched
+            if any(path.startswith(prefix) for prefix in required_paths)
+        ]
+        if matched:
+            reasons.append("paths:" + ",".join(matched[:8]))
+    return reasons
+
+
 def release_preflight(
     *,
     identity: RunIdentity,
@@ -109,6 +152,10 @@ def release_preflight(
     implementer_profile: str | None = None,
     changes_events: Sequence[Mapping[str, Any]] | None = None,
     previous_code_commit: str | None = None,
+    authorization_mode: str = AUTHORIZATION_SOURCE_FILE,
+    require_authorization_paths: Sequence[str] = (),
+    authorization_window_seconds: int = 900,
+    card_risk: str | None = None,
     now: int | None = None,
 ) -> ReleaseDecision:
     repo_path = Path(repo)
@@ -269,7 +316,6 @@ def release_preflight(
     reasons.extend(round_problems)
 
     # -- 5. authorization --------------------------------------------------
-    authorization, authorization_shape = load_authorization(authorization_path)
     expected_main = evaluation.main_commit
     expected = {
         "requirement_id": requirement_id,
@@ -286,8 +332,98 @@ def release_preflight(
         "main_ref": main_ref,
         "main_commit": expected_main,
     }
+    # Unknown modes fail closed to the historical file semantics.
+    if authorization_mode not in (
+        AUTHORIZATION_SOURCE_FILE,
+        AUTHORIZATION_SOURCE_POLICY,
+    ):
+        authorization_mode = AUTHORIZATION_SOURCE_FILE
+    authorization_source = AUTHORIZATION_SOURCE_FILE
+    policy_generated = False
+    policy_reasons: list[str] = []
+
+    authorization, authorization_shape = load_authorization(authorization_path)
     authorization_issues = list(authorization_shape)
-    if authorization is not None:
+    high_risk = False
+
+    if authorization_mode == AUTHORIZATION_SOURCE_POLICY:
+        policy_reasons = _policy_high_risk_reasons(
+            card_risk, binding, repo_path, require_authorization_paths
+        )
+        high_risk = bool(policy_reasons)
+        if not high_risk:
+            current = int(time.time()) if now is None else int(now)
+            window = authorization_window_seconds
+            if (
+                isinstance(window, bool)
+                or not isinstance(window, int)
+                or window <= 0
+            ):
+                authorization_issues.append("authorization-window-invalid")
+            else:
+                generated = build_policy_authorization(
+                    expected,
+                    approved_at=current,
+                    expires_at=current + window,
+                )
+                if generated is None:
+                    authorization_issues.append(
+                        "authorization-required:binding-unavailable"
+                    )
+                else:
+                    # Write the record, then reload it so the exact document
+                    # the merge is authorized by passes the same strict
+                    # loader as an operator-written file.
+                    generated_path = run_dir / POLICY_AUTHORIZATION_FILENAME
+                    _write_json(generated_path, generated.to_dict())
+                    authorization, generated_shape = load_authorization(
+                        generated_path
+                    )
+                    authorization_issues = list(generated_shape)
+                    authorization_source = AUTHORIZATION_SOURCE_POLICY
+                    policy_generated = True
+                    if authorization is not None:
+                        authorization_issues.extend(
+                            authorization_problems(
+                                authorization,
+                                expected,
+                                now=now,
+                                implementer=implementer_profile,
+                                reviewer=binding.reviewer
+                                if binding is not None
+                                else None,
+                                executor=executor_profile,
+                                allow_policy_approver=True,
+                            )
+                        )
+        else:
+            # High risk falls back to file/human authorization; a forged
+            # ``policy:`` approver is rejected here as it is in file mode.
+            file_issues = list(authorization_shape)
+            if authorization is not None:
+                file_issues.extend(
+                    authorization_problems(
+                        authorization,
+                        expected,
+                        now=now,
+                        implementer=implementer_profile,
+                        reviewer=binding.reviewer
+                        if binding is not None
+                        else None,
+                        executor=executor_profile,
+                    )
+                )
+            file_issues = list(dict.fromkeys(file_issues))
+            if file_issues or authorization is None:
+                # Make the policy refusal the primary reason (release_once
+                # reports reasons[0]) while keeping the audit detail.
+                authorization_issues = [
+                    "authorization-required:high-risk",
+                    *file_issues,
+                ]
+            else:
+                authorization_issues = []
+    elif authorization is not None:
         authorization_issues.extend(
             authorization_problems(
                 authorization,
@@ -304,6 +440,7 @@ def release_preflight(
         not authorization_issues and authorization is not None,
         detail="ok" if not authorization_issues else ";".join(authorization_issues),
         reasons=authorization_issues,
+        source=authorization_source,
     )
     reasons.extend(authorization_issues)
 
@@ -397,13 +534,27 @@ def release_preflight(
         "main_ref": main_ref,
         "main_commit": main_commit,
         "authorization": {
-            "path": _run_relative_path(
-                authorization.path
-                if authorization is not None and authorization.path is not None
-                else authorization_path
+            "path": (
+                Path(authorization.path).name
+                if policy_generated
+                and authorization is not None
+                and authorization.path is not None
+                else _run_relative_path(
+                    authorization.path
+                    if authorization is not None and authorization.path is not None
+                    else authorization_path
+                )
             ),
             "sha256": authorization.sha256 if authorization is not None else None,
             "approver": authorization.approver if authorization is not None else None,
+            "source": authorization_source,
+            "policy": {
+                "mode": authorization_mode,
+                "generated": policy_generated,
+                "high_risk": high_risk,
+                "high_risk_reasons": list(policy_reasons),
+                "required_paths": list(require_authorization_paths),
+            },
         },
         "checks": checks,
         "verdict": verdict,

@@ -620,13 +620,72 @@ def test_classify_failure_matrix():
 
 
 def test_classify_auth_wins_over_capacity_when_both_match():
+    # The HTTP context token makes the 401 a real status; auth still wins over
+    # the capacity phrase.
     parsed = CodexAdapter().parse(
-        _jsonl({"type": "turn.failed", "error": {"message": "401 rate limit"}})
+        _jsonl({"type": "turn.failed", "error": {"message": "HTTP 401 rate limit"}})
     )
     outcome = CodexAdapter().classify(1, parsed)
     assert (outcome.category, outcome.block_kind) == (
         "environment_failure",
         "capability",
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "request id 1401 failed",
+        "ruff check reports F401 shutil imported but unused",
+        "upstream returned https://x.test/?id=1401",
+        "timestamp 1794335401 exceeded the budget",
+    ],
+)
+def test_classify_failure_numeric_substrings_are_not_environment(message):
+    """``1401``/``F401``/epochs are not HTTP statuses: keep failure semantics."""
+
+    parsed = CodexAdapter().parse(
+        _jsonl({"type": "turn.failed", "error": {"message": message}})
+    )
+    outcome = CodexAdapter().classify(1, parsed)
+    assert (outcome.category, outcome.block_kind) == (
+        "code_failure",
+        "needs_input",
+    )
+
+
+def test_classify_stderr_url_with_numeric_id_is_not_auth():
+    parsed = CodexAdapter().parse(
+        _jsonl({"type": "turn.failed", "error": {"message": "execution failed"}})
+    )
+    outcome = CodexAdapter().classify(
+        1, parsed, stderr="see https://x.test/?id=1401 for details"
+    )
+    assert (outcome.category, outcome.block_kind) == (
+        "code_failure",
+        "needs_input",
+    )
+
+
+def test_classify_stderr_http_401_is_still_capability():
+    parsed = CodexAdapter().parse(
+        _jsonl({"type": "turn.failed", "error": {"message": "execution failed"}})
+    )
+    outcome = CodexAdapter().classify(1, parsed, stderr="HTTP 401 Unauthorized")
+    assert (outcome.category, outcome.block_kind) == (
+        "environment_failure",
+        "capability",
+    )
+
+
+def test_classify_stderr_http_429_is_still_transient():
+    parsed = CodexAdapter().parse(
+        _jsonl({"type": "turn.failed", "error": {"message": "execution failed"}})
+    )
+    outcome = CodexAdapter().classify(1, parsed, stderr="HTTP 429 Too Many Requests")
+    assert (outcome.category, outcome.block_kind) == (
+        "environment_failure",
+        "transient",
     )
 
 

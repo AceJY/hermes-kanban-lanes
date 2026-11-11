@@ -23,6 +23,7 @@ import importlib.metadata
 import json
 import os
 import platform as platform_module
+import shlex
 import shutil
 import sys
 import sysconfig
@@ -41,6 +42,7 @@ EXIT_INVALID = 2
 EXIT_LOCK = 3
 
 DISTRIBUTION_NAME = "hermes-kanban-lanes"
+DIST_INFO_SUFFIX = ".dist-info"
 LEAK_MIN_LENGTH = 8
 
 
@@ -401,6 +403,67 @@ def _generation_paths() -> list[str]:
     return roots
 
 
+def _dist_info_entries(root: str) -> list[tuple[str, str, str]]:
+    """HKL ``(name, version, path)`` metadata entries directly under ``root``.
+
+    Only this distribution is matched (after normalising ``-``/``_``).  A
+    generation with more than one such entry is ambiguous: ``importlib.metadata``
+    may resolve any of them, which is exactly the W14 upgrade failure.
+    """
+
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    entries: list[tuple[str, str, str]] = []
+    for name in names:
+        if not name.endswith(DIST_INFO_SUFFIX):
+            continue
+        stem = name[: -len(DIST_INFO_SUFFIX)]
+        distribution, separator, version = stem.partition("-")
+        if not separator:
+            continue
+        if distribution.lower().replace("_", "-") != DISTRIBUTION_NAME:
+            continue
+        entries.append((name, version, os.path.join(str(root), name)))
+    return entries
+
+
+def _dist_info_cleanup_command(entries: Sequence[tuple[str, str, str]]) -> str:
+    """An exact, read-only-to-print cleanup command for stale metadata."""
+
+    return "rm -rf " + " ".join(
+        shlex.quote(path) for _name, _version, path in entries
+    )
+
+
+def _version_sort_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    """Order the simple PEP 440 releases this product ships.
+
+    ``importlib.metadata`` cannot tell us which of several metadata
+    directories was written last, so the ambiguity guard treats the highest
+    version as the one a chain of upgrades installed.  Numeric release
+    segments compare numerically; anything else is kept as a deterministic
+    lexicographic tie-breaker.
+    """
+
+    key: list[tuple[int, int, str]] = []
+    for token in version.replace("-", ".").replace("+", ".").split("."):
+        if token.isdigit():
+            key.append((0, int(token), ""))
+        else:
+            key.append((1, 0, token))
+    return tuple(key)
+
+
+def _newest_dist_info_entry(
+    entries: Sequence[tuple[str, str, str]],
+) -> tuple[str, str, str]:
+    """The metadata directory a successful upgrade chain installed last."""
+
+    return max(entries, key=lambda entry: (_version_sort_key(entry[1]), entry[0]))
+
+
 def _is_within(path: str, root: str) -> bool:
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
@@ -455,6 +518,44 @@ def _plugin_runtime_check(
     )
     import_path = str(module_file) if module_file else "missing"
     suffix = f"; reinstall: {reinstall}; generation={generation}"
+
+    # `pip install --target` never removes old `*.dist-info` directories, so a
+    # second upgrade can leave several versions in *one* generation.  Doctor
+    # must fail here and print the exact cleanup command, not wait for the
+    # launcher probe to stall the service on the next start.  Roots are checked
+    # independently: several interpreters on ``sys.path`` may each expose one
+    # copy, which is not the same-generation ambiguity this guards against.
+    ambiguous: list[tuple[str, str, str]] = []
+    kept: list[tuple[str, str, str]] = []
+    stale: list[tuple[str, str, str]] = []
+    seen_roots: set[str] = set()
+    for root in roots:
+        resolved = os.path.realpath(root)
+        if resolved in seen_roots:
+            continue
+        seen_roots.add(resolved)
+        entries = _dist_info_entries(root)
+        if len(entries) <= 1:
+            continue
+        ambiguous.extend(entries)
+        # ``__version__`` itself is unreliable here: it is exactly the
+        # ``importlib.metadata`` lookup that resolves an arbitrary directory
+        # in an ambiguous generation.  Within each root keep the highest
+        # version -- the one a chain of ``pip install --target`` upgrades
+        # wrote last -- and tell the operator to remove the rest.  Roots are
+        # handled independently: each interpreter copy must keep its own
+        # current directory.
+        keep = _newest_dist_info_entry(entries)
+        kept.append(keep)
+        stale.extend(entry for entry in entries if entry[0] != keep[0])
+    if ambiguous:
+        detail = (
+            "plugin-runtime-dist-info-ambiguous; "
+            f"dirs={','.join(entry[0] for entry in ambiguous)}; "
+            f"keep={','.join(entry[0] for entry in kept)}; "
+            f"cleanup: {_dist_info_cleanup_command(stale)}{suffix}"
+        )
+        return _check("plugin-runtime", False, detail)
 
     if distribution is None:
         return _check(

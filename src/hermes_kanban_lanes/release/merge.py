@@ -27,6 +27,7 @@ from ..workspace.git import (
     current_branch,
     diff_paths,
     is_ancestor,
+    merge_tree_preflight,
     repo_head,
     resolve_ref,
     run_git,
@@ -35,6 +36,9 @@ from .binding import allow_matches
 
 MERGE_SCHEMA_VERSION = 1
 POSTMERGE_SCHEMA_VERSION = 1
+NOTIFY_SCHEMA_VERSION = 1
+NOTIFY_DIRNAME = "notify"
+NOTIFY_REPORT_FILENAME = "report.json"
 # D9-I rule 4: the critical section holds the board write lock across the merge.
 # The merge must therefore be bounded well below the host ``busy_timeout``
 # (120s), so a slow merge aborts and releases the lock instead of freezing every
@@ -111,6 +115,80 @@ def _parents_of(commit: str, *, repo: Path) -> list[str]:
     return fields[1:]
 
 
+def _scope_preflight(
+    *,
+    repo_path: Path,
+    main_before: str,
+    reviewed_head: str,
+    allow: Sequence[str],
+    protected_roots: Sequence[str],
+    timeout: float,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Predict the merge tree and run every D7 scope check **before** merging.
+
+    ``git merge-tree --write-tree`` writes objects only: it never moves a ref,
+    never touches the index or the worktree and never creates ``MERGE_HEAD``.
+    Its tree is the tree ``git merge`` would commit, so the allow/protected/
+    reviewed-path assertions can be evaluated on the same facts *before* the
+    branch is moved.  A refusal here therefore means byte-for-byte unchanged
+    git state, not "merge first, refuse afterwards".
+
+    Returns ``(facts, reasons)``; ``facts`` is ``None`` when the dry-run merge
+    itself could not produce a tree.
+    """
+
+    try:
+        clean, detail = merge_tree_preflight(
+            main_before, reviewed_head, repo=repo_path, timeout=timeout
+        )
+    except GitError:
+        return None, ["merge-tree-error"]
+    if not clean:
+        if detail == "merge-conflict":
+            # A conflicting merge cannot create a commit, so there is nothing
+            # to fail open: let ``git merge`` produce the conflict, abort it and
+            # record ``merge-conflict`` exactly as before.  (This also keeps
+            # the in-progress-merge/timeout path observable.)
+            return None, []
+        # An unreadable dry run cannot prove the scope; fail closed.
+        return None, [detail]
+
+    merge_tree = detail
+    try:
+        changed = diff_paths(main_before, merge_tree, cwd=repo_path)
+        reviewed_touched = [
+            path
+            for path in diff_paths(main_before, reviewed_head, cwd=repo_path)
+            if allow_matches(path, allow)
+        ]
+        after_merge = set(diff_paths(reviewed_head, merge_tree, cwd=repo_path))
+    except GitError:
+        return None, ["merge-tree-error"]
+
+    outside = [path for path in changed if not allow_matches(path, allow)]
+    protected = [path for path in changed if _protected(path, protected_roots)]
+    reviewed_changed = [path for path in reviewed_touched if path in after_merge]
+
+    reasons: list[str] = []
+    # The protected root is the hard stop; naming it first keeps the card's
+    # block reason (reasons[0]) on the protection violation even when the same
+    # path also leaves the card's allow list.
+    if protected:
+        reasons.append(f"protected-root-touched:{len(protected)}")
+    if outside:
+        reasons.append(f"outside-allow:{len(outside)}")
+    if reviewed_changed:
+        reasons.append(f"merge-changed-reviewed-paths:{len(reviewed_changed)}")
+
+    return {
+        "merge_tree": merge_tree,
+        "changed_paths": changed,
+        "outside_allow_paths": outside,
+        "protected_root_paths": protected,
+        "reviewed_paths_changed_by_merge": reviewed_changed,
+    }, reasons
+
+
 @dataclass(frozen=True, slots=True)
 class MergeRecord:
     ok: bool
@@ -119,6 +197,22 @@ class MergeRecord:
     merge_sha: str | None = None
     merge_tree: str | None = None
     main_before: str | None = None
+
+    @property
+    def merged(self) -> bool:
+        """True when a new merge commit actually exists on ``main``.
+
+        ``ok`` additionally requires every post-merge assertion to hold.  A
+        refusal that happened after ``git merge`` must never be mistaken for a
+        refusal that left ``main`` untouched: this property is the dedupe key
+        recovery and the release report use.
+        """
+
+        return (
+            self.merge_sha is not None
+            and self.main_before is not None
+            and self.merge_sha != self.main_before
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.document)
@@ -264,6 +358,62 @@ def merge_release(
         _write_json(run_path / "merge.json", document)
         return MergeRecord(False, document, tuple(reasons), main_before=main_before)
 
+    # D7 scope assertions must be decided *before* the branch moves.  The old
+    # order merged first and refused afterwards, which made every hard check
+    # (protected roots in particular) fail open: the commit was already on
+    # ``main`` while the card reported ``refused``.
+    scope, scope_reasons = _scope_preflight(
+        repo_path=repo_path,
+        main_before=main_before,
+        reviewed_head=reviewed_head,
+        allow=allow,
+        protected_roots=protected_roots,
+        timeout=timeout,
+    )
+    if scope_reasons:
+        scope = scope or {}
+        outside = list(scope.get("outside_allow_paths") or [])
+        protected = list(scope.get("protected_root_paths") or [])
+        reviewed_changed = list(scope.get("reviewed_paths_changed_by_merge") or [])
+        document = {
+            "schema_version": MERGE_SCHEMA_VERSION,
+            "requirement_id": requirement_id,
+            "identity": identity.to_dict(),
+            "task_id": task_id,
+            "main_before": main_before,
+            "reviewed_head": reviewed_head,
+            "merge_sha": None,
+            "merge_tree": None,
+            "parents": [],
+            "main_before_is_ancestor": False,
+            "changed_paths": list(scope.get("changed_paths") or []),
+            "outside_allow": len(outside),
+            "outside_allow_paths": outside,
+            "reviewed_paths_changed_by_merge": reviewed_changed,
+            "protected_roots_touched": len(protected),
+            "protected_root_paths": protected,
+            "command": {
+                "argv": command_argv,
+                "exit_code": None,
+                "timed_out": False,
+                "stdout_log": None,
+                "stdout_sha256": None,
+                "stdout_size": None,
+                "stderr_log": None,
+                "stderr_sha256": None,
+                "stderr_size": None,
+                "preflight": "merge-tree",
+                "preflight_merge_tree": scope.get("merge_tree"),
+            },
+            "verdict": "refused",
+            "reasons": list(scope_reasons),
+            "aborted": False,
+            "merged": False,
+            "stage": "pre-merge",
+        }
+        _write_json(run_path / "merge.json", document)
+        return MergeRecord(False, document, tuple(scope_reasons), main_before=main_before)
+
     args = command_argv[1:]
     result = None
     error: str | None = None
@@ -314,6 +464,34 @@ def merge_release(
                 if _conflicted(stdout_text) or _conflicted(stderr_text)
                 else "merge-failed"
             )
+
+        # ``git merge`` may have committed before exiting non-zero (for
+        # example a failing clean-up step).  If the new HEAD really is the
+        # two-parent merge we asked for, the honest record is "merged"; it must
+        # never be written as a pre-merge ``refused`` with ``merge_sha: null``.
+        try:
+            head_after = repo_head(repo_path)
+        except GitError:
+            head_after = None
+        if (
+            head_after is not None
+            and head_after != main_before
+            and set(_parents_of(head_after, repo=repo_path))
+            == {main_before, reviewed_head}
+        ):
+            command_entry["merge_commit_observed_after_failure"] = True
+            return _record_merge_assertions(
+                repo_path=repo_path,
+                run_path=run_path,
+                identity=identity,
+                requirement_id=requirement_id,
+                task_id=task_id,
+                main_before=main_before,
+                reviewed_head=reviewed_head,
+                allow=allow,
+                protected_roots=protected_roots,
+                command_entry=command_entry,
+            )
         document = {
             "schema_version": MERGE_SCHEMA_VERSION,
             "requirement_id": requirement_id,
@@ -327,12 +505,16 @@ def merge_release(
             "main_before_is_ancestor": True,
             "changed_paths": [],
             "outside_allow": 0,
+            "outside_allow_paths": [],
             "reviewed_paths_changed_by_merge": [],
             "protected_roots_touched": 0,
+            "protected_root_paths": [],
             "command": command_entry,
             "verdict": "refused",
             "reasons": reasons,
             "aborted": aborted,
+            "merged": False,
+            "stage": "merge-attempt",
         }
         _write_json(run_path / "merge.json", document)
         return MergeRecord(False, document, tuple(reasons), main_before=main_before)
@@ -412,7 +594,16 @@ def _record_merge_assertions(
     if reviewed_changed:
         reasons.append(f"merge-changed-reviewed-paths:{len(reviewed_changed)}")
 
-    verdict = "merged" if not reasons else "refused"
+    merged = merge_sha is not None and merge_sha != main_before
+    # A refusal *after* ``git merge`` succeeded must never be written as
+    # ``refused``: the commit exists on ``main`` and recovery/reporting need
+    # the merge_sha as the dedupe key.  Only a pre-merge refusal is "refused".
+    if not reasons:
+        verdict = "merged"
+    elif merged:
+        verdict = "merged-with-failures"
+    else:
+        verdict = "refused"
     document = {
         "schema_version": MERGE_SCHEMA_VERSION,
         "requirement_id": requirement_id,
@@ -433,6 +624,8 @@ def _record_merge_assertions(
         "command": dict(command_entry),
         "verdict": verdict,
         "reasons": reasons,
+        "merged": merged,
+        "stage": "post-merge" if merged else "merge-attempt",
     }
     _write_json(run_path / "merge.json", document)
     return MergeRecord(
@@ -672,6 +865,230 @@ def run_post_merge(
     return document
 
 
+# ---------------------------------------------------------------------------
+# merge notification hook (optional, ops-owned argv)
+# ---------------------------------------------------------------------------
+
+
+def notify_report_path(run_dir: str | os.PathLike[str]) -> Path:
+    return Path(run_dir) / NOTIFY_DIRNAME / NOTIFY_REPORT_FILENAME
+
+
+def _read_notify_report(path: Path) -> dict[str, Any] | None:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def merge_notification_sent(
+    run_dir: str | os.PathLike[str], merge_sha: str
+) -> bool:
+    """True when ``merge_sha`` was already handed to the notify commands.
+
+    The report is keyed by ``merge_sha``: a resumed release must never notify
+    the same merge twice, whether the earlier attempt passed or failed.
+    """
+
+    document = _read_notify_report(notify_report_path(run_dir))
+    return document is not None and document.get("merge_sha") == merge_sha
+
+
+def _notify_env(
+    *,
+    requirement_id: str,
+    board: str,
+    merge_task_id: str,
+    dev_task_id: str,
+    merge_sha: str,
+    merge_tree: str | None,
+    reviewed_head: str,
+    reviewed_tree: str | None,
+    main_before: str,
+    evidence_index_sha256: str | None,
+    authorization_source: str,
+    repo: Path,
+    run_dir: Path,
+) -> dict[str, str]:
+    """The daemon's own environment plus the merge facts, all as strings."""
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "HKL_REQUIREMENT_ID": str(requirement_id),
+            "HKL_BOARD": str(board),
+            "HKL_MERGE_TASK_ID": str(merge_task_id),
+            "HKL_DEV_TASK_ID": str(dev_task_id),
+            "HKL_MERGE_SHA": str(merge_sha),
+            "HKL_MERGE_TREE": "" if merge_tree is None else str(merge_tree),
+            "HKL_REVIEWED_HEAD": str(reviewed_head),
+            "HKL_REVIEWED_TREE": (
+                "" if reviewed_tree is None else str(reviewed_tree)
+            ),
+            "HKL_MAIN_BEFORE": str(main_before),
+            "HKL_EVIDENCE_INDEX_SHA256": (
+                "" if evidence_index_sha256 is None else str(evidence_index_sha256)
+            ),
+            "HKL_AUTHORIZATION_SOURCE": str(authorization_source),
+            "HKL_REPO": str(repo),
+            "HKL_RUN_DIR": str(run_dir),
+        }
+    )
+    return env
+
+
+def run_merge_notify(
+    *,
+    repo: str | os.PathLike[str],
+    run_dir: str | os.PathLike[str],
+    merge_sha: str,
+    merge_tree: str | None,
+    commands: Sequence[Sequence[str]],
+    timeout_seconds: float,
+    requirement_id: str,
+    board: str,
+    merge_task_id: str,
+    dev_task_id: str,
+    reviewed_head: str,
+    reviewed_tree: str | None,
+    main_before: str,
+    evidence_index_sha256: str | None,
+    authorization_source: str,
+) -> dict[str, Any]:
+    """Run the configured notify argv after a release merge is complete.
+
+    This is an ops hook, not a sandboxed card command: it runs with the
+    daemon's own ``os.environ`` (so external CLIs can find ``HOME`` and their
+    credentials) and with ``cwd`` set to the merged repository root.  The
+    ``HKL_*`` variables carry the merge facts.  A call is idempotent per
+    ``merge_sha``: an existing ``notify/report.json`` for the same merge is
+    returned untouched and no command runs again.
+
+    Without configured ``commands`` nothing is created and nothing is run.
+    """
+
+    repo_path = Path(repo)
+    run_path = Path(run_dir)
+    report_path = notify_report_path(run_path)
+
+    if not commands:
+        return {
+            "schema_version": NOTIFY_SCHEMA_VERSION,
+            "requirement_id": requirement_id,
+            "merge_sha": merge_sha,
+            "merge_tree": merge_tree,
+            "commands": [],
+            "verdict": "skipped",
+            "reasons": ["notify-disabled"],
+            "notified": False,
+        }
+
+    existing = _read_notify_report(report_path)
+    if existing is not None and existing.get("merge_sha") == merge_sha:
+        existing = dict(existing)
+        existing["skipped"] = True
+        return existing
+
+    notify_dir = run_path / NOTIFY_DIRNAME
+    env = _notify_env(
+        requirement_id=requirement_id,
+        board=board,
+        merge_task_id=merge_task_id,
+        dev_task_id=dev_task_id,
+        merge_sha=merge_sha,
+        merge_tree=merge_tree,
+        reviewed_head=reviewed_head,
+        reviewed_tree=reviewed_tree,
+        main_before=main_before,
+        evidence_index_sha256=evidence_index_sha256,
+        authorization_source=authorization_source,
+        repo=repo_path,
+        run_dir=run_path,
+    )
+    reasons: list[str] = []
+    entries: list[dict[str, Any]] = []
+    for index, argv in enumerate(commands):
+        stdout_relative = f"{NOTIFY_DIRNAME}/{index}.stdout.log"
+        stderr_relative = f"{NOTIFY_DIRNAME}/{index}.stderr.log"
+        started = time.monotonic()
+        exit_code: int | None = None
+        timed_out = False
+        error: str | None = None
+        try:
+            result = run_command(
+                list(argv),
+                cwd=repo_path,
+                env=env,
+                timeout=float(timeout_seconds),
+                capture=True,
+                stdout_log_path=notify_dir / f"{index}.stdout.log",
+                stderr_log_path=notify_dir / f"{index}.stderr.log",
+            )
+            exit_code = result.exit_code
+            timed_out = result.timed_out
+        except CommandGroupError as exc:
+            exit_code = exc.result.exit_code
+            timed_out = exc.result.timed_out
+            error = f"process-group:{exc.reason}"
+        except (OSError, ValueError) as exc:
+            error = f"command-error:{type(exc).__name__}"
+        duration = time.monotonic() - started
+        stdout_path = run_path / stdout_relative
+        stderr_path = run_path / stderr_relative
+        entry: dict[str, Any] = {
+            "argv": [str(part) for part in argv],
+            "cwd": str(repo_path),
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stdout_log": stdout_relative,
+            "stdout_sha256": (
+                sha256_file(stdout_path) if stdout_path.is_file() else None
+            ),
+            "stdout_size": (
+                stdout_path.stat().st_size if stdout_path.is_file() else None
+            ),
+            "stderr_log": stderr_relative,
+            "stderr_sha256": (
+                sha256_file(stderr_path) if stderr_path.is_file() else None
+            ),
+            "stderr_size": (
+                stderr_path.stat().st_size if stderr_path.is_file() else None
+            ),
+            "duration_seconds": round(duration, 3),
+        }
+        if error is not None:
+            entry["error"] = error
+            reasons.append(f"notify-command-error:{index}")
+        elif timed_out:
+            reasons.append(f"notify-timeout:{index}")
+        elif exit_code != 0:
+            reasons.append(f"notify-failed:{index}")
+        entries.append(entry)
+
+    document = {
+        "schema_version": NOTIFY_SCHEMA_VERSION,
+        "requirement_id": requirement_id,
+        "merge_task_id": merge_task_id,
+        "dev_task_id": dev_task_id,
+        "merge_sha": merge_sha,
+        "merge_tree": merge_tree,
+        "reviewed_head": reviewed_head,
+        "reviewed_tree": reviewed_tree,
+        "main_before": main_before,
+        "evidence_index_sha256": evidence_index_sha256,
+        "authorization_source": authorization_source,
+        "repo": str(repo_path),
+        "run_dir": str(run_path),
+        "commands": entries,
+        "verdict": "fail" if reasons else "pass",
+        "reasons": reasons,
+        "notified": True,
+    }
+    _write_json(report_path, document)
+    return document
+
+
 __all__ = [
     "DEFAULT_PROTECTED_ROOTS",
     "MERGE_COMMITTER_EMAIL",
@@ -679,8 +1096,14 @@ __all__ = [
     "MERGE_SCHEMA_VERSION",
     "MERGE_TIMEOUT",
     "MergeRecord",
+    "NOTIFY_DIRNAME",
+    "NOTIFY_REPORT_FILENAME",
+    "NOTIFY_SCHEMA_VERSION",
     "POSTMERGE_SCHEMA_VERSION",
+    "merge_notification_sent",
     "merge_release",
+    "notify_report_path",
     "record_existing_merge",
+    "run_merge_notify",
     "run_post_merge",
 ]

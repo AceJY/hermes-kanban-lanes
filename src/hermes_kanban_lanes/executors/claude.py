@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,25 +22,97 @@ from typing import Any, Sequence
 from .base import ExecutorOutcome
 
 PASSTHROUGH_WITH_VALUE = ("--model", "--max-budget-usd", "--effort")
-_AUTH_KEYWORDS = (
-    "not logged in",
-    "invalid api key",
-    "401",
-    "403",
-    "oauth",
-    "credit balance",
-    "authentication",
-    "unauthorized",
+# Phrase-level auth/capacity signals.  Matching is done against structured
+# fields, stderr, and (only when ``is_error=true``) the executor's own error
+# message in ``result`` -- never the model's summary on a successful run.  HTTP
+# codes are handled separately below with token boundaries and line context.
+# Bare substrings such as "401" are intentionally absent: ``F401`` or a
+# 10-digit epoch must not look like an authentication failure.
+_AUTH_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bnot logged in\b",
+        r"\binvalid api key\b",
+        r"\boauth",
+        r"\bcredit balance\b",
+        r"\bauthentication",
+        r"\bunauthorized",
+        r"\bforbidden",
+    )
 )
-_CAPACITY_KEYWORDS = (
-    "rate limit",
-    "overloaded",
-    "429",
-    "503",
-    "econnreset",
-    "etimedout",
-    "network",
+_CAPACITY_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\brate[\s_-]*limit(?:ed)?\b",
+        r"\boverloaded\b",
+        r"\btoo many requests\b",
+        r"\bservice unavailable\b",
+        r"\beconnreset\b",
+        r"\betimedout\b",
+        r"\bnetwork\b",
+        r"\btimeout\b",
+        r"\btimed out\b",
+    )
 )
+# An HTTP status counts only when it is an independent numeric token on a line
+# that also carries http/status/error semantics.  ``\b`` keeps ``F401``,
+# ``?id=1401`` and ``1794335401`` clean; ``\bhttp\b`` does not match the
+# ``https`` scheme, so ordinary URLs never count as context.
+_HTTP_STATUS = re.compile(r"\b(401|403|429|503)\b")
+_HTTP_CONTEXT = re.compile(r"\b(?:http|status|error)\b", re.IGNORECASE)
+_AUTH_STATUSES = frozenset({401, 403})
+_CAPACITY_STATUSES = frozenset({429, 503})
+
+
+def _structured_status(parsed: dict[str, Any]) -> int | None:
+    """Return ``api_error_status`` as an integer when it is a real code."""
+
+    value = parsed.get("api_error_status") if isinstance(parsed, dict) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _http_signal(*texts: str) -> str | None:
+    """Classify HTTP status tokens found in diagnostic text.
+
+    Returns ``"auth"`` (401/403), ``"capacity"`` (429/503) or ``None``.  Auth
+    wins when both appear so a genuine credential failure is never downgraded
+    to a retryable one.
+    """
+
+    auth = False
+    capacity = False
+    for text in texts:
+        for line in (text or "").splitlines():
+            if not _HTTP_CONTEXT.search(line):
+                continue
+            for match in _HTTP_STATUS.finditer(line):
+                code = int(match.group(1))
+                if code in _AUTH_STATUSES:
+                    auth = True
+                elif code in _CAPACITY_STATUSES:
+                    capacity = True
+    if auth:
+        return "auth"
+    if capacity:
+        return "capacity"
+    return None
+
+
+def _phrase_signal(text: str) -> str | None:
+    """Return the auth/capacity phrase signal in ``text`` (auth wins)."""
+
+    lowered = (text or "").lower()
+    if any(pattern.search(lowered) for pattern in _AUTH_PATTERNS):
+        return "auth"
+    if any(pattern.search(lowered) for pattern in _CAPACITY_PATTERNS):
+        return "capacity"
+    return None
 
 
 class ClaudeAdapter:
@@ -230,9 +303,25 @@ class ClaudeAdapter:
         terminal_reason = (
             parsed.get("terminal_reason") if isinstance(parsed, dict) else None
         )
-        haystack = " ".join(
-            part for part in (result_text, str(terminal_reason or ""), stderr or "") if part
-        ).lower()
+        # Structured reasons are CLI-authored, not model prose, so they may be
+        # inspected.  ``result_text`` only joins them when the host itself
+        # flagged the run as failed (``is_error=true``): then it is the
+        # executor's error message, not the model's summary.  A successful
+        # summary mentioning ``F401 shutil`` or ``1108 passed`` must never be
+        # classified and used to discard a completed run.
+        error_text = result_text if is_error else ""
+        structured_reasons = "\n".join(
+            part
+            for part in (
+                str(terminal_reason or ""),
+                str(parsed.get("subtype") or "") if isinstance(parsed, dict) else "",
+                str(parsed.get("stop_reason") or "") if isinstance(parsed, dict) else "",
+            )
+            if part
+        )
+        evidence = "\n".join(
+            part for part in (structured_reasons, error_text, stderr or "") if part
+        )
 
         def outcome(category: str, block_kind: str | None) -> ExecutorOutcome:
             return ExecutorOutcome(
@@ -247,9 +336,19 @@ class ClaudeAdapter:
                 parsed=parsed,
             )
 
-        if any(keyword in haystack for keyword in _AUTH_KEYWORDS):
+        signal = None
+        status = _structured_status(parsed)
+        if status in _AUTH_STATUSES:
+            signal = "auth"
+        elif status in _CAPACITY_STATUSES:
+            signal = "capacity"
+        else:
+            signal = _http_signal(structured_reasons, error_text, stderr or "")
+        if signal is None:
+            signal = _phrase_signal(evidence)
+        if signal == "auth":
             return outcome("environment_failure", "capability")
-        if any(keyword in haystack for keyword in _CAPACITY_KEYWORDS):
+        if signal == "capacity":
             return outcome("environment_failure", "transient")
         if exit_code == 0 and not is_error:
             return outcome("success", None)

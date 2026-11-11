@@ -9,13 +9,16 @@ the merge result.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from hermes_kanban_lanes.card_contract import CardSpec, load_card
+from hermes_kanban_lanes.release.binding import evaluate_binding
 from hermes_kanban_lanes.runtime.release import (
     _dev_cards,
+    _normalise_review_runs,
     observe_reviews,
     queue_release_cards,
 )
@@ -30,6 +33,7 @@ from w4_helpers import (
     queue_merge_card,
     release_run_dir,
     review_body,
+    review_changes,
     review_pass,
     run_dev,
     run_rows,
@@ -229,6 +233,70 @@ def test_w4_01_full_review_release_chain(
     assert len(board.child_ids(task_id)) == 1
 
 
+def _policy_config(config):
+    """The same lane with ``review.merge.authorization = "policy"``."""
+
+    return replace(
+        config,
+        review=replace(
+            config.review,
+            merge=replace(config.review.merge, authorization="policy"),
+        ),
+    )
+
+
+def test_w4_policy_authorization_merges_a_normal_card(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """Policy mode writes its own auditable record, then the real merge runs."""
+
+    facts = _setup(
+        tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+    )
+    config = _policy_config(facts["config"])
+    task_id = facts["task_id"]
+
+    # No operator authorization file is written: ordinary risk is policy-approved.
+    merge_task_id, merge_card = queue_merge_card(board, config, task_id)
+    _merge_identity, outcome = claim_and_release(
+        board, config, merge_task_id, merge_card
+    )
+    assert outcome["action"] == "merged", outcome
+    assert outcome["terminal_ok"] is True
+    merge_sha = outcome["merge_sha"]
+    assert merge_sha
+
+    release_dir = release_run_dir(config.work_root, merge_task_id)
+    report = json.loads(
+        (release_dir / "release-report.json").read_text(encoding="utf-8")
+    )
+    assert report["verdict"] == "release-ready"
+    assert report["authorization"]["source"] == "policy"
+    assert report["authorization"]["approver"] == "policy:auto"
+    assert report["authorization"]["policy"]["generated"] is True
+
+    generated = json.loads(
+        (release_dir / "authorization.json").read_text(encoding="utf-8")
+    )
+    assert generated["source"] == "policy"
+    assert generated["approver"] == "policy:auto"
+    assert generated["reviewed_head"] == report["reviewed_head"]
+    assert generated["reviewed_tree"] == report["reviewed_tree"]
+    assert generated["evidence_index_sha256"] == report["evidence_index_sha256"]
+    assert generated["main_commit"] == facts["base"]
+    assert generated["expires_at"] > generated["approved_at"]
+
+    assert repo_head(facts["repo"]) == merge_sha
+    merge_document = json.loads(
+        (release_dir / "merge.json").read_text(encoding="utf-8")
+    )
+    assert merge_document["parents"] == [
+        facts["base"],
+        merge_document["reviewed_head"],
+    ]
+    assert task_row(board, merge_task_id)["status"] == "done"
+
+
 def test_tampered_review_declaration_never_queues_a_merge_card(
     tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
 ):
@@ -251,9 +319,15 @@ def test_tampered_review_declaration_never_queues_a_merge_card(
         review_run_id=facts["review_identity"].run_id,
         rework_round=1,
     )
-    assert queue_release_cards(
+    queued = queue_release_cards(
         config.work_root, board, config, requirement_id=REQUIREMENT
-    ) == []
+    )
+    matches = [
+        entry for entry in queued if entry.get("dev_task_id") == facts["task_id"]
+    ]
+    assert len(matches) == 1, queued
+    assert matches[0]["skipped"] == "review-metadata-incomplete"
+    assert "review-head-not-run" in matches[0]["reason"]
     assert board.child_ids(facts["task_id"]) == []
     assert repo_head(facts["repo"]) == facts["base"]
 
@@ -421,6 +495,161 @@ def test_w8_d2b_explicit_card_wins_over_run_snapshot(
     assert merge_document["allow"] == ["RESULT.txt", "EXPLICIT.txt"]
 
 
+# ---------------------------------------------------------------------------
+# Scope vs. baseline sync: only the card's own commits may be judged
+# ---------------------------------------------------------------------------
+
+#: Round one writes the allowed file *and* advances ``main`` while the
+#: executor is running.  The supervisor's baseline sync then merges that new
+#: trunk commit into the card branch, so the next round's continuation base
+#: contains trunk paths the card never authored.
+_ADVANCE_MAIN_DURING_RUN = """
+import subprocess
+repo = {repo!r}
+Path(repo, "pyproject.toml").write_text("version = '9.9.9'\\n", encoding="utf-8")
+subprocess.run(
+    ["git", "-C", repo, "add", "pyproject.toml"], check=True, capture_output=True
+)
+subprocess.run(
+    [
+        "git", "-C", repo,
+        "-c", "user.name=HKL Tests",
+        "-c", "user.email=hkl@example.invalid",
+        "commit", "--no-verify", "-q", "-m", "advance main",
+    ],
+    check=True,
+    capture_output=True,
+)
+Path("docs/x.md").parent.mkdir(parents=True, exist_ok=True)
+Path("docs/x.md").write_text("round one\\n", encoding="utf-8")
+print(json.dumps({{"is_error": False, "result": "done"}}))
+"""
+
+
+def _advance_main_during_run(repo: Path) -> str:
+    return _ADVANCE_MAIN_DURING_RUN.format(repo=str(repo))
+
+
+def _scope_with_a_synced_continuation_base(
+    tmp_path,
+    board,
+    make_task,
+    make_repo,
+    make_config,
+    write_card,
+    fake_executor,
+    *,
+    round_two_path: str,
+):
+    """Round 1 syncs a trunk advance; return the round-2 scope check.
+
+    ``task_base`` (round 1) != ``continuation_base`` (round 2) because the
+    baseline sync merged ``main`` into the card branch between rounds.
+    """
+
+    repo = make_repo()
+    task_base = repo_head(repo)
+    round_one = fake_executor(_advance_main_during_run(repo))
+    round_two = fake_executor(review_body(write=round_two_path, content="round two\n"))
+    config = w4_config(
+        make_config,
+        board_path=board.board_path,
+        repo_path=repo,
+        executor_argv=[round_one],
+        max_rework_rounds=3,
+    )
+    task_id = make_task(title="scope after sync")
+    card = load_card(
+        write_card(config.work_root, task_id, allow=("docs/x.md",)), config
+    )
+
+    identity_one, outcome_one = run_dev(
+        board, config, card, task_id, executor_argv=round_one
+    )
+    assert outcome_one.category == "success", outcome_one.reason
+    run_one = dev_run_dir(config.work_root, task_id, identity_one.run_id)
+    document_one = json.loads((run_one / "run.json").read_text(encoding="utf-8"))
+    assert document_one["task_base_commit"] == task_base
+    assert document_one["continuation_base"] == task_base
+    assert document_one["baseline"]["updated"] is True
+    continuation_base = document_one["code_commit"]
+    assert continuation_base == document_one["baseline"]["merge_commit"]
+
+    # The continuation base really contains the trunk's pyproject change.
+    synced = run_git(
+        ["diff", "--name-only", task_base, continuation_base], cwd=repo
+    ).stdout.split()
+    assert "pyproject.toml" in synced
+
+    assert review_changes(board, task_id, "please continue")[0] is True
+    identity_two, outcome_two = run_dev(
+        board, config, card, task_id, executor_argv=round_two
+    )
+    run_two = dev_run_dir(config.work_root, task_id, identity_two.run_id)
+    document_two = json.loads((run_two / "run.json").read_text(encoding="utf-8"))
+    assert document_two["round"] == 2
+    assert document_two["task_base_commit"] == task_base
+    assert document_two["continuation_base"] == continuation_base
+
+    # A two-dot diff from task_base still shows the trunk's pyproject path:
+    # that is exactly what the old scope check judged.
+    cumulative = run_git(
+        ["diff", "--name-only", task_base, document_two["run_commit"]], cwd=repo
+    ).stdout.split()
+    assert "pyproject.toml" in cumulative
+
+    gate = json.loads(
+        (run_two / document_two["gate"]["report_path"]).read_text(encoding="utf-8")
+    )
+    scope = next(check for check in gate["checks"] if check["name"] == "scope")
+    return outcome_two, scope
+
+
+def test_scope_ignores_trunk_paths_merged_by_baseline_sync(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """Only the card's own path is judged, even when task_base != continuation."""
+
+    outcome, scope = _scope_with_a_synced_continuation_base(
+        tmp_path,
+        board,
+        make_task,
+        make_repo,
+        make_config,
+        write_card,
+        fake_executor,
+        round_two_path="docs/x.md",
+    )
+
+    assert outcome.category == "success", outcome.reason
+    assert scope["ok"] is True, scope
+    assert scope["changed_paths"] == ["docs/x.md"]
+
+
+def test_scope_still_rejects_a_card_authored_path_outside_allow(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """Excluding trunk paths must not turn the gate green for a real violation."""
+
+    outcome, scope = _scope_with_a_synced_continuation_base(
+        tmp_path,
+        board,
+        make_task,
+        make_repo,
+        make_config,
+        write_card,
+        fake_executor,
+        round_two_path="CHANGELOG.md",
+    )
+
+    assert outcome.category == "code_failure", outcome.reason
+    assert scope["ok"] is False
+    assert "path outside allow: CHANGELOG.md" in scope["detail"]
+    assert "CHANGELOG.md" in scope["changed_paths"]
+    # The trunk's own pyproject change is still not attributed to the card.
+    assert "pyproject.toml" not in scope["changed_paths"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
@@ -461,3 +690,194 @@ def test_w8_d2b_missing_or_invalid_snapshot_is_reported(
     assert matches[0]["skipped"] == reason
     assert reason in matches[0]["reason"]
     assert board.child_ids(task_id) == []
+
+
+# ---------------------------------------------------------------------------
+# W11e: the reviewer's run profile is the mechanical reviewer fact
+# ---------------------------------------------------------------------------
+
+_SRC_DIR = Path(__file__).resolve().parents[2] / "src" / "hermes_kanban_lanes"
+
+
+def _rewrite_review_metadata(board, run_id: int, metadata: dict) -> None:
+    board.connection.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata), run_id),
+    )
+    board.connection.commit()
+
+
+def _real_native_review_metadata(facts) -> dict:
+    """The metadata Hermes native reviewer runs actually record.
+
+    No ``reviewer`` and no ``dev_run_id``: the run identity carries the former
+    and the development run index carries the latter.
+    """
+
+    run_document = json.loads(
+        (facts["run_dir"] / "run.json").read_text(encoding="utf-8")
+    )
+    return {
+        "verdict": "pass",
+        "review_outcome": "approved",
+        "reviewed_commit": run_document["code_commit"],
+        "reviewed_tree": facts["review_metadata"]["reviewed_tree"],
+        "review_round": 1,
+    }
+
+
+def _evaluate(facts, board):
+    config = facts["config"]
+    task_id = facts["task_id"]
+    evaluation_runs = _normalise_review_runs(
+        config.work_root,
+        task_id,
+        board.run_rows(task_id),
+        config=config,
+        requirement_id=REQUIREMENT,
+    )
+    return evaluate_binding(
+        task_row=board.task_row(task_id),
+        runs=evaluation_runs,
+        dev_run_dir=facts["run_dir"],
+        repo=config.repositories["primary"].path,
+        requirement_id=REQUIREMENT,
+        package_dir=_SRC_DIR,
+        executor_profile=facts["card"].executor,
+    )
+
+
+def _set_review_profile(board, run_id: int, profile: str | None) -> None:
+    board.connection.execute(
+        "UPDATE task_runs SET profile = ? WHERE id = ?", (profile, run_id)
+    )
+    board.connection.commit()
+
+
+def _queue_for(facts, board):
+    config = facts["config"]
+    queued = queue_release_cards(
+        config.work_root, board, config, requirement_id=REQUIREMENT
+    )
+    return [
+        entry
+        for entry in queued
+        if entry.get("dev_task_id") == facts["task_id"]
+    ]
+
+
+def test_native_review_without_reviewer_key_uses_the_run_profile(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """The run row's profile fills ``reviewer`` -- never a name from prose."""
+
+    facts = _setup(
+        tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+    )
+    review_run_id = facts["review_identity"].run_id
+    metadata = _real_native_review_metadata(facts)
+    assert "reviewer" not in metadata
+    assert "dev_run_id" not in metadata
+    _rewrite_review_metadata(board, review_run_id, metadata)
+
+    review_run = next(
+        run
+        for run in board.run_rows(facts["task_id"])
+        if run["id"] == review_run_id
+    )
+    assert review_run["profile"] == REVIEWER
+
+    evaluation = _evaluate(facts, board)
+    assert evaluation.problems == ()
+    assert evaluation.binding is not None
+    assert evaluation.binding.reviewer == REVIEWER
+
+    matches = _queue_for(facts, board)
+    assert len(matches) == 1, matches
+    entry = matches[0]
+    assert "skipped" not in entry
+    merge_task_id = entry["merge_task_id"]
+    assert task_row(board, merge_task_id)["assignee"] == "hkl:merge"
+    assert board.parent_ids(merge_task_id) == [facts["task_id"]]
+
+
+def test_missing_reviewer_and_profile_is_reported_not_silent(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """No metadata reviewer and no run profile: a named, visible skip."""
+
+    facts = _setup(
+        tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+    )
+    review_run_id = facts["review_identity"].run_id
+    _rewrite_review_metadata(
+        board, review_run_id, _real_native_review_metadata(facts)
+    )
+    _set_review_profile(board, review_run_id, None)
+
+    evaluation = _evaluate(facts, board)
+    assert "review-reviewer-invalid" in evaluation.problems
+    assert evaluation.binding is None
+
+    matches = _queue_for(facts, board)
+    assert len(matches) == 1, matches
+    assert matches[0]["skipped"] == "review-metadata-incomplete"
+    assert "reviewer" in matches[0]["reason"]
+    assert board.child_ids(facts["task_id"]) == []
+
+
+def test_reviewer_profile_matching_the_implementer_is_still_invalid(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """Deriving from the run profile must not weaken the implementer check."""
+
+    facts = _setup(
+        tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+    )
+    review_run_id = facts["review_identity"].run_id
+    _rewrite_review_metadata(
+        board, review_run_id, _real_native_review_metadata(facts)
+    )
+    dev_profile = next(
+        run["profile"]
+        for run in board.run_rows(facts["task_id"])
+        if run["id"] == facts["identity"].run_id
+    )
+    _set_review_profile(board, review_run_id, dev_profile)
+
+    evaluation = _evaluate(facts, board)
+    assert "reviewer-is-implementer" in evaluation.problems
+
+    matches = _queue_for(facts, board)
+    assert len(matches) == 1, matches
+    assert matches[0]["skipped"] == "review-metadata-incomplete"
+    assert "reviewer-is-implementer" in matches[0]["reason"]
+    assert board.child_ids(facts["task_id"]) == []
+
+
+def test_declared_reviewer_matching_the_implementer_is_invalid(
+    tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+):
+    """An explicit ``reviewer`` equal to the implementer never binds."""
+
+    facts = _setup(
+        tmp_path, board, make_task, make_repo, make_config, write_card, fake_executor
+    )
+    review_run_id = facts["review_identity"].run_id
+    dev_profile = next(
+        run["profile"]
+        for run in board.run_rows(facts["task_id"])
+        if run["id"] == facts["identity"].run_id
+    )
+    metadata = _real_native_review_metadata(facts)
+    metadata["reviewer"] = dev_profile
+    _rewrite_review_metadata(board, review_run_id, metadata)
+
+    evaluation = _evaluate(facts, board)
+    assert "reviewer-is-implementer" in evaluation.problems
+    assert "review-reviewer-mismatch" in evaluation.problems
+
+    matches = _queue_for(facts, board)
+    assert len(matches) == 1, matches
+    assert matches[0]["skipped"] == "review-metadata-incomplete"
+    assert board.child_ids(facts["task_id"]) == []

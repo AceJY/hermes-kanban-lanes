@@ -230,6 +230,7 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -237,6 +238,8 @@ from pathlib import Path
 
 PROBE_FLAG = "--package-probe"
 SITE_MODULE = "site"
+DISTRIBUTION_NAME = "hermes-kanban-lanes"
+DIST_INFO_SUFFIX = ".dist-info"
 
 
 def _now():
@@ -363,6 +366,110 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _dist_info_version(name):
+    """Return the version of an HKL ``*.dist-info`` entry, else ``None``.
+
+    Only this distribution is matched (after normalising ``-``/``_``), so the
+    cleanup and probe never see metadata that belongs to another package.
+    """
+
+    if not name.endswith(DIST_INFO_SUFFIX):
+        return None
+    stem = name[: -len(DIST_INFO_SUFFIX)]
+    distribution, separator, version = stem.partition("-")
+    if not separator:
+        return None
+    if distribution.lower().replace("_", "-") != DISTRIBUTION_NAME:
+        return None
+    return version
+
+
+def _dist_info_entries(generation):
+    """Sorted ``(name, version)`` pairs for HKL metadata in ``generation``."""
+
+    try:
+        names = os.listdir(generation)
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        version = _dist_info_version(name)
+        if version is not None:
+            entries.append((name, version))
+    return sorted(entries)
+
+
+def _dist_info_problem(generation, expected):
+    """Return a fail-closed reason unless exactly ``expected`` metadata exists."""
+
+    entries = _dist_info_entries(generation)
+    # ``pip install --target`` can leave one ``*.dist-info`` per historical
+    # version, at which point ``importlib.metadata`` picks an arbitrary one.
+    if not entries:
+        return "plugin-version-dist-missing"
+    if len(entries) > 1:
+        return "plugin-version-ambiguous:%s" % ",".join(
+            name for name, _version in entries
+        )
+    if entries[0][1] != expected:
+        return "plugin-version-mismatch:%s" % entries[0][1]
+    return None
+
+
+def _target_version(state):
+    """The product version the staged wheel installs.
+
+    The wheel filename is authoritative: ``state["product_version"]`` was
+    written by whichever distribution metadata ``importlib`` happened to
+    resolve when the service was staged.  An already-ambiguous generation can
+    therefore record an older version than the staged wheel, and trusting it
+    would make the cleanup below preserve exactly the stale metadata it is
+    meant to remove.
+    """
+
+    wheel = os.path.basename(state.get("wheel") or "")
+    if wheel.endswith(".whl"):
+        parts = wheel[: -len(".whl")].split("-")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return str(state.get("product_version") or "")
+
+
+def _prune_stale_dist_info(state, generation, target):
+    """Remove HKL metadata for versions other than ``target`` before install.
+
+    ``pip install --target`` overwrites the package directory but never the
+    old ``*.dist-info``; repeated upgrades therefore leave several versions
+    behind and ``importlib.metadata`` can resolve an arbitrary one.  Only
+    directories belonging to this distribution are touched -- never a blanket
+    ``*.dist-info`` glob, which would delete unrelated packages.
+    """
+
+    removed = []
+    if not target:
+        return removed
+    for name, version in _dist_info_entries(generation):
+        if version == target:
+            continue
+        path = os.path.join(generation, name)
+        try:
+            if os.path.islink(path) or os.path.isfile(path):
+                os.unlink(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                continue
+        except OSError as exc:
+            _append_log(
+                state,
+                "dist-info cleanup failed %s: %s" % (name, type(exc).__name__),
+            )
+            continue
+        removed.append(name)
+        _append_log(state, "dist-info cleanup removed %s" % name)
+    return removed
+
+
 def _anchored_generation(candidate, hermes_home):
     """Only accept ``HERMES_HOME/installs/*/environments/*/venv`` generations."""
 
@@ -464,6 +571,12 @@ def _under(path, root):
 def _probe(state, runtime, generation):
     if not generation:
         return False, "generation-site-packages-unresolved"
+    expected = _target_version(state)
+    # Check the metadata before importing: mixed versions can make the probe
+    # itself fail, and "ambiguous" is the actionable reason.
+    problem = _dist_info_problem(generation, expected)
+    if problem:
+        return False, problem
     tail = state["daemon_argv"]
     prefix = runtime[: len(runtime) - len(tail)] if tail else runtime
     command = prefix + [PROBE_FLAG]
@@ -489,7 +602,11 @@ def _probe(state, runtime, generation):
             break
     if payload is None:
         return False, "package-probe-invalid"
-    expected = str(state.get("product_version") or "")
+    # Re-assert after the probe ran: no start may proceed while the generation
+    # holds more than the one metadata directory for the staged wheel.
+    problem = _dist_info_problem(generation, expected)
+    if problem:
+        return False, problem
     if payload.get("dist_version") != expected:
         return False, "plugin-version-mismatch:%s" % payload.get("dist_version")
     if payload.get("version") != expected:
@@ -555,6 +672,9 @@ def _install(state, runtime, generation):
         return "wheel-missing", None
     if not generation:
         return "generation-site-packages-unresolved", None
+    # Heal the deterministic upgrade defect first: stale metadata from older
+    # versions is what makes the probe resolve the wrong distribution version.
+    _prune_stale_dist_info(state, generation, _target_version(state))
     command = [
         runtime[0],
         "-m",
@@ -581,6 +701,9 @@ def _install(state, runtime, generation):
         return None, None
     uv = state.get("uv")
     if uv and os.path.isfile(uv):
+        # The failed pip attempt may have left (partial) metadata behind; the
+        # uv path must also start from exactly the target version.
+        _prune_stale_dist_info(state, generation, _target_version(state))
         fallback = [
             uv,
             "pip",

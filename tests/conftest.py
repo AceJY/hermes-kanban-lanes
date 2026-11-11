@@ -344,19 +344,61 @@ def task_status(board):
     return _status
 
 
+#: Tests in ``test_w6_receipt.py`` that read the private evidence archive.
+W6_ARCHIVE_TESTS = frozenset(
+    {
+        "test_receipt_json_paths_exist_in_commit_tree",
+        "test_receipt_md_evidence_paths_exist_and_are_not_logs",
+    }
+)
+
+
+def _is_committable(repo_root: Path, relpath: str) -> bool:
+    """True when git would include ``relpath`` in the next commit."""
+
+    tracked = _git("ls-files", "--", relpath, cwd=repo_root).stdout.strip()
+    if tracked:
+        return True
+    addable = _git(
+        "ls-files", "--others", "--exclude-standard", "--", relpath, cwd=repo_root
+    ).stdout.strip()
+    return bool(addable)
+
+
+def _w6_receipt_is_committed(repo_root: Path) -> bool:
+    """Whether the W6 receipt is tracked or addable in this checkout.
+
+    Existence on disk is not enough: ``artifacts/`` can be present but ignored
+    (for example through ``.git/info/exclude``), in which case the receipt can
+    never reach the commit tree and the archive-backed assertions cannot hold.
+    """
+
+    receipt = repo_root / "artifacts" / "w6" / "receipt.json"
+    if not receipt.is_file():
+        return False
+    return _is_committable(repo_root, "artifacts/w6/receipt.json")
+
+
 def pytest_collection_modifyitems(config, items):
-    """Skip tests that read the private evidence archive when it is absent.
+    """Skip archive-backed tests when the receipt is not committable here.
 
     ``artifacts/`` holds private run evidence and is deliberately excluded from
     the public export (see ``tools/public_export.py``).  The archive-backed
-    assertions still run everywhere the archive exists; only an export tree
-    skips them, and the skip is reported by pytest.
+    assertions run only where the receipt itself can be committed (tracked or
+    addable); an export tree, or a checkout whose local excludes hide the
+    archive, skips them and reports that through pytest.
     """
 
-    if (REPO_ROOT / "artifacts" / "w6" / "receipt.json").is_file():
+    if _w6_receipt_is_committed(REPO_ROOT):
         return
-    skip = pytest.mark.skip(reason="private W6 evidence archive is not exported")
+    skip = pytest.mark.skip(
+        reason="private W6 evidence archive is not committed in this checkout"
+    )
     for item in items:
         path = getattr(item, "path", None)
-        if path is not None and Path(str(path)).name == "test_w6_receipt.py":
+        if (
+            path is not None
+            and Path(str(path)).name == "test_w6_receipt.py"
+            and item.name in W6_ARCHIVE_TESTS
+        ):
             item.add_marker(skip)

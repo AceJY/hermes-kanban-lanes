@@ -56,10 +56,24 @@ MERGE_KEYS = (
     "post_merge_commands",
     "post_merge_timeout_seconds",
 )
+# Additive, optional keys.  All have defaults so existing configurations
+# round-trip unchanged.
+MERGE_OPTIONAL_KEYS = (
+    "authorization",
+    "require_authorization_paths",
+    "authorization_window_seconds",
+    # Merge notification hook (ops-owned argv, never card/model output).
+    "notify_commands",
+    "notify_timeout_seconds",
+)
+AUTHORIZATION_MODES = frozenset({"file", "policy"})
+DEFAULT_AUTHORIZATION_MODE = "file"
+DEFAULT_AUTHORIZATION_WINDOW_SECONDS = 900
 DEFAULT_REVIEWER = "code-reviewer"
 DEFAULT_MAX_REWORK_ROUNDS = 3
 DEFAULT_MAIN_REF = "refs/heads/main"
 DEFAULT_POST_MERGE_TIMEOUT_SECONDS = 3600.0
+DEFAULT_NOTIFY_TIMEOUT_SECONDS = 60.0
 
 # -- W6 D3: optional service/logging blocks --------------------------------
 SERVICE_KEYS = ("platform", "label", "log_root", "restart")
@@ -224,10 +238,41 @@ class MergeConfig:
     main_ref: str = DEFAULT_MAIN_REF
     post_merge_commands: tuple[tuple[str, ...], ...] = ()
     post_merge_timeout_seconds: float = DEFAULT_POST_MERGE_TIMEOUT_SECONDS
+    notify_commands: tuple[tuple[str, ...], ...] = ()
+    notify_timeout_seconds: float = DEFAULT_NOTIFY_TIMEOUT_SECONDS
+    authorization: str = DEFAULT_AUTHORIZATION_MODE
+    require_authorization_paths: tuple[str, ...] = ()
+    authorization_window_seconds: int = DEFAULT_AUTHORIZATION_WINDOW_SECONDS
 
     def __post_init__(self) -> None:
         _expect_bool(self.enabled, "LaneConfig.review.merge.enabled")
         _expect_str(self.main_ref, "LaneConfig.review.merge.main_ref", non_empty=True)
+        _expect_enum(
+            self.authorization,
+            "LaneConfig.review.merge.authorization",
+            AUTHORIZATION_MODES,
+        )
+        if not isinstance(self.require_authorization_paths, (list, tuple)):
+            raise ContractError(
+                "LaneConfig.review.merge.require_authorization_paths: "
+                "expected an array"
+            )
+        prefixes: list[str] = []
+        for index, item in enumerate(self.require_authorization_paths):
+            base = (
+                "LaneConfig.review.merge.require_authorization_paths"
+                f"[{index}]"
+            )
+            prefix = _expect_str(item, base, non_empty=True)
+            if prefix.startswith("/") or ".." in prefix.split("/"):
+                raise ContractError(f"{base}: expected a repository-relative path")
+            prefixes.append(prefix)
+        object.__setattr__(self, "require_authorization_paths", tuple(prefixes))
+        _expect_int(
+            self.authorization_window_seconds,
+            "LaneConfig.review.merge.authorization_window_seconds",
+            positive=True,
+        )
         if not isinstance(self.post_merge_commands, (list, tuple)):
             raise ContractError(
                 "LaneConfig.review.merge.post_merge_commands: expected an array"
@@ -258,14 +303,68 @@ class MergeConfig:
                 "expected a positive number"
             )
         object.__setattr__(self, "post_merge_timeout_seconds", float(timeout))
+        if not isinstance(self.notify_commands, (list, tuple)):
+            raise ContractError(
+                "LaneConfig.review.merge.notify_commands: expected an array"
+            )
+        notify_commands = []
+        for index, argv in enumerate(self.notify_commands):
+            base = f"LaneConfig.review.merge.notify_commands[{index}]"
+            if not isinstance(argv, (list, tuple)):
+                raise ContractError(f"{base}: expected an array")
+            if not argv:
+                raise ContractError(f"{base}: must not be empty")
+            notify_commands.append(
+                tuple(
+                    _expect_str(item, f"{base}[{position}]", non_empty=True)
+                    for position, item in enumerate(argv)
+                )
+            )
+        object.__setattr__(self, "notify_commands", tuple(notify_commands))
+        notify_timeout = self.notify_timeout_seconds
+        if isinstance(notify_timeout, bool) or not isinstance(
+            notify_timeout, (int, float)
+        ):
+            raise ContractError(
+                "LaneConfig.review.merge.notify_timeout_seconds: "
+                "expected a number"
+            )
+        if notify_timeout <= 0:
+            raise ContractError(
+                "LaneConfig.review.merge.notify_timeout_seconds: "
+                "expected a positive number"
+            )
+        object.__setattr__(self, "notify_timeout_seconds", float(notify_timeout))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "enabled": self.enabled,
             "main_ref": self.main_ref,
             "post_merge_commands": [list(argv) for argv in self.post_merge_commands],
             "post_merge_timeout_seconds": self.post_merge_timeout_seconds,
         }
+        # Omitted defaults stay omitted so an existing config round-trips
+        # byte-for-byte (and its fingerprint does not change).
+        if self.authorization != DEFAULT_AUTHORIZATION_MODE:
+            document["authorization"] = self.authorization
+        if self.require_authorization_paths:
+            document["require_authorization_paths"] = list(
+                self.require_authorization_paths
+            )
+        if (
+            self.authorization_window_seconds
+            != DEFAULT_AUTHORIZATION_WINDOW_SECONDS
+        ):
+            document["authorization_window_seconds"] = (
+                self.authorization_window_seconds
+            )
+        if self.notify_commands:
+            document["notify_commands"] = [
+                list(argv) for argv in self.notify_commands
+            ]
+        if self.notify_timeout_seconds != DEFAULT_NOTIFY_TIMEOUT_SECONDS:
+            document["notify_timeout_seconds"] = self.notify_timeout_seconds
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,7 +791,12 @@ class LaneConfig:
             authorization_dir = None
 
         merge_entry = _expect_mapping(entry["merge"], f"{field}.merge")
-        _expect_exact_keys(merge_entry, f"{field}.merge", MERGE_KEYS)
+        _expect_exact_keys(
+            merge_entry,
+            f"{field}.merge",
+            MERGE_KEYS,
+            optional=MERGE_OPTIONAL_KEYS,
+        )
         enabled = _expect_bool(merge_entry["enabled"], f"{field}.merge.enabled")
         main_ref = _expect_str(
             merge_entry["main_ref"], f"{field}.merge.main_ref", non_empty=True
@@ -724,6 +828,67 @@ class LaneConfig:
                 "expected a positive number"
             )
 
+        authorization = _expect_enum(
+            merge_entry.get("authorization", DEFAULT_AUTHORIZATION_MODE),
+            f"{field}.merge.authorization",
+            AUTHORIZATION_MODES,
+        )
+        raw_prefixes = merge_entry.get("require_authorization_paths", [])
+        if not isinstance(raw_prefixes, list):
+            raise ContractError(
+                f"{field}.merge.require_authorization_paths: expected an array"
+            )
+        prefixes: list[str] = []
+        for index, item in enumerate(raw_prefixes):
+            base = f"{field}.merge.require_authorization_paths[{index}]"
+            prefix = _expect_str(item, base, non_empty=True)
+            if prefix.startswith("/") or ".." in prefix.split("/"):
+                raise ContractError(
+                    f"{base}: expected a repository-relative path"
+                )
+            prefixes.append(prefix)
+        window = _expect_int(
+            merge_entry.get(
+                "authorization_window_seconds",
+                DEFAULT_AUTHORIZATION_WINDOW_SECONDS,
+            ),
+            f"{field}.merge.authorization_window_seconds",
+            positive=True,
+        )
+
+        raw_notify = merge_entry.get("notify_commands", [])
+        if not isinstance(raw_notify, list):
+            raise ContractError(
+                f"{field}.merge.notify_commands: expected an array"
+            )
+        notify_commands = []
+        for index, argv in enumerate(raw_notify):
+            base = f"{field}.merge.notify_commands[{index}]"
+            if not isinstance(argv, list):
+                raise ContractError(f"{base}: expected an array")
+            if not argv:
+                raise ContractError(f"{base}: must not be empty")
+            notify_commands.append(
+                tuple(
+                    _expect_str(item, f"{base}[{position}]", non_empty=True)
+                    for position, item in enumerate(argv)
+                )
+            )
+        notify_timeout = merge_entry.get(
+            "notify_timeout_seconds", DEFAULT_NOTIFY_TIMEOUT_SECONDS
+        )
+        if isinstance(notify_timeout, bool) or not isinstance(
+            notify_timeout, (int, float)
+        ):
+            raise ContractError(
+                f"{field}.merge.notify_timeout_seconds: expected a number"
+            )
+        if notify_timeout <= 0:
+            raise ContractError(
+                f"{field}.merge.notify_timeout_seconds: "
+                "expected a positive number"
+            )
+
         return ReviewConfig(
             reviewer=reviewer,
             max_rework_rounds=max_rework_rounds,
@@ -733,6 +898,11 @@ class LaneConfig:
                 main_ref=main_ref,
                 post_merge_commands=tuple(post_merge_commands),
                 post_merge_timeout_seconds=float(timeout),
+                notify_commands=tuple(notify_commands),
+                notify_timeout_seconds=float(notify_timeout),
+                authorization=authorization,
+                require_authorization_paths=tuple(prefixes),
+                authorization_window_seconds=window,
             ),
         )
 

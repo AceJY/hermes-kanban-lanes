@@ -1463,6 +1463,189 @@ def test_launcher_does_not_reinstall_a_current_generation(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_launcher_prunes_stale_dist_info_before_install(tmp_path, product_wheel):
+    """A version upgrade removes old metadata before installing the new wheel.
+
+    ``pip install --target`` never deletes an older ``*.dist-info``.  With
+    several of them present ``importlib.metadata`` may resolve an arbitrary
+    version, so healing must clean this distribution's stale metadata first and
+    log every directory it removed.
+    """
+
+    work = tmp_path / "w14-stale-dist-info"
+    work.mkdir()
+    generation_python = _new_generation(work)
+    site_packages = _generation_site_packages(generation_python)
+    stale = []
+    for stale_version in ("0.1.0", "0.2.0"):
+        entry = site_packages / f"hermes_kanban_lanes-{stale_version}.dist-info"
+        entry.mkdir()
+        (entry / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: hermes-kanban-lanes\n"
+            f"Version: {stale_version}\n",
+            encoding="utf-8",
+        )
+        stale.append(entry)
+    # Cleanup is scoped to this distribution: another package's metadata in
+    # the same generation must survive untouched.
+    unrelated = site_packages / "otherpkg-1.0.dist-info"
+    unrelated.mkdir()
+
+    daemon, sentinel = _write_fake_daemon(work)
+    config = _config(tmp_path, launcher=False)
+    _write_generation_launcher(tmp_path / "hermes", generation_python, daemon)
+    config_path = _config_path(tmp_path)
+    home = work / "home"
+    staged = stage_service_state(
+        config,
+        config_path,
+        home=home,
+        wheel_path=product_wheel,
+        hermes_home=home / ".hermes",
+    )
+
+    result = _run_launcher(staged)
+    assert result.returncode == 0, result.stderr
+    assert sentinel.is_file()
+    assert not Path(staged["marker"]).exists()
+
+    remaining = sorted(
+        path.name
+        for path in site_packages.glob("hermes_kanban_lanes-*.dist-info")
+    )
+    assert remaining == [f"hermes_kanban_lanes-{__version__}.dist-info"]
+    assert unrelated.is_dir()
+
+    log = (Path(staged["state_dir"]) / "launcher.log").read_text(encoding="utf-8")
+    for entry in stale:
+        assert f"dist-info cleanup removed {entry.name}" in log
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_launcher_prunes_against_wheel_version_not_stale_recorded_version(
+    tmp_path, product_wheel
+):
+    """The staged wheel wins when ``product_version`` was resolved stale.
+
+    ``stage_service_state`` records ``__version__``, an
+    ``importlib.metadata`` lookup that is itself ambiguous in a generation
+    left behind by earlier upgrades.  Cleanup must key on the wheel filename;
+    trusting a stale recorded version would preserve exactly the metadata the
+    probe cannot resolve.
+    """
+
+    work = tmp_path / "w14-stale-product-version"
+    work.mkdir()
+    generation_python = _new_generation(work)
+    site_packages = _generation_site_packages(generation_python)
+    stale = []
+    for stale_version in ("0.1.0", "0.2.0"):
+        entry = site_packages / f"hermes_kanban_lanes-{stale_version}.dist-info"
+        entry.mkdir()
+        (entry / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: hermes-kanban-lanes\n"
+            f"Version: {stale_version}\n",
+            encoding="utf-8",
+        )
+        stale.append(entry)
+
+    daemon, sentinel = _write_fake_daemon(work)
+    config = _config(tmp_path, launcher=False)
+    _write_generation_launcher(tmp_path / "hermes", generation_python, daemon)
+    config_path = _config_path(tmp_path)
+    home = work / "home"
+    staged = stage_service_state(
+        config,
+        config_path,
+        home=home,
+        wheel_path=product_wheel,
+        hermes_home=home / ".hermes",
+    )
+    # Simulate a staging CLI whose ambiguous lookup resolved the oldest
+    # metadata directory instead of the version the wheel installs.
+    state_file = Path(staged["state_file"])
+    document = json.loads(state_file.read_text(encoding="utf-8"))
+    document["product_version"] = "0.1.0"
+    state_file.write_text(json.dumps(document), encoding="utf-8")
+
+    result = _run_launcher(staged)
+    assert result.returncode == 0, result.stderr
+    assert sentinel.is_file()
+    assert not Path(staged["marker"]).exists()
+
+    remaining = sorted(
+        path.name
+        for path in site_packages.glob("hermes_kanban_lanes-*.dist-info")
+    )
+    assert remaining == [f"hermes_kanban_lanes-{__version__}.dist-info"]
+
+    log = (Path(staged["state_dir"]) / "launcher.log").read_text(encoding="utf-8")
+    for entry in stale:
+        assert f"dist-info cleanup removed {entry.name}" in log
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_launcher_ambiguous_dist_info_fails_closed(tmp_path, product_wheel):
+    """A generation that stays ambiguous after healing never starts the daemon.
+
+    The fake probe recreates a stale ``dist-info`` on every invocation, so the
+    second probe still sees two versions.  The launcher must mark
+    ``plugin-version-ambiguous`` and exit without executing the daemon.
+    """
+
+    work = tmp_path / "w14-ambiguous-dist-info"
+    work.mkdir()
+    generation_python = _new_generation(work)
+    site_packages = _generation_site_packages(generation_python)
+    stale_name = "hermes_kanban_lanes-0.1.0.dist-info"
+    daemon = work / "fake_daemon.py"
+    sentinel = work / "daemon-started.json"
+    daemon.write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        f"SITE = {str(site_packages)!r}\n"
+        f"STALE = os.path.join(SITE, {stale_name!r})\n"
+        "if '--package-probe' in sys.argv:\n"
+        "    os.makedirs(STALE, exist_ok=True)\n"
+        "    print(json.dumps({\n"
+        f"        'version': {__version__!r},\n"
+        f"        'dist_version': {__version__!r},\n"
+        "        'file': os.path.join(\n"
+        "            SITE, 'hermes_kanban_lanes', '__init__.py'\n"
+        "        ),\n"
+        "    }))\n"
+        "    raise SystemExit(0)\n"
+        f"with open({str(sentinel)!r}, 'w', encoding='utf-8') as handle:\n"
+        "    handle.write('started')\n",
+        encoding="utf-8",
+    )
+    config = _config(tmp_path, launcher=False)
+    _write_generation_launcher(tmp_path / "hermes", generation_python, daemon)
+    config_path = _config_path(tmp_path)
+    home = work / "home"
+    staged = stage_service_state(
+        config,
+        config_path,
+        home=home,
+        wheel_path=product_wheel,
+        hermes_home=home / ".hermes",
+    )
+
+    result = _run_launcher(staged)
+    assert result.returncode == 3, result.stderr
+    assert not sentinel.exists()
+
+    marker = json.loads(Path(staged["marker"]).read_text(encoding="utf-8"))
+    assert marker["reason"].startswith("plugin-version-ambiguous:")
+    assert stale_name in marker["reason"]
+    log = (Path(staged["state_dir"]) / "launcher.log").read_text(encoding="utf-8")
+    assert "plugin-version-ambiguous" in log
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
 def test_launcher_uv_fallback_without_pip(tmp_path, product_wheel):
     """A generation without pip heals through ``uv pip install --python``.
 
@@ -1740,7 +1923,11 @@ def test_install_failure_records_stderr_and_uv_rc(tmp_path):
     _write_generation_launcher(tmp_path / "hermes", generation_python, daemon)
     config_path = _config_path(tmp_path)
     home = work / "home"
-    corrupt = work / "dist" / "hermes_kanban_lanes-0.2.0-py3-none-any.whl"
+    corrupt = (
+        work
+        / "dist"
+        / f"hermes_kanban_lanes-{__version__}-py3-none-any.whl"
+    )
     corrupt.parent.mkdir()
     corrupt.write_bytes(b"this is not a wheel")
     staged = stage_service_state(

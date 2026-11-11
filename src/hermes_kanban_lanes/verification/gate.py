@@ -4,10 +4,19 @@ The gate is run by the supervisor, never by the executor.  A passing verdict
 requires every one of the five checks to pass; a missing or unreadable
 workspace produces ``blocked`` rather than a silent pass.
 
-Scope and progress are always computed from the *original* base to the
-run-authored commit (``run_commit``), never from a baseline merge commit: the
-merge only brings the repository forward and must not widen what the run is
-allowed to change.  ``run_gate`` never commits, merges or writes ``main``.
+Scope and progress judge only what the run authored, never the paths a
+baseline merge brought in: the merge only brings the repository forward and
+must not widen what the run is allowed to change.  ``run_gate`` never commits,
+merges or writes ``main``.
+
+The scope diff is three-dot from the baseline ``sync_base`` to the run-authored
+commit (``run_commit``).  That is ``git diff <merge-base> <run_commit>``: it
+contains every change the card itself authored across its rounds, and none of
+the paths that advanced ``main`` and were merged in by the baseline sync.  This
+matters for a rework round, whose continuation base already contains the trunk
+advance merged by the previous round: a two-dot diff from ``task_base`` would
+grow with main and flag compliant cards whenever the trunk moved during the
+card's lifetime.
 """
 
 from __future__ import annotations
@@ -120,6 +129,24 @@ def _prepare_workspace(workspace: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _scope_merge_base(sync_base: str, run_commit: str, *, workspace: str) -> str:
+    """Return ``git merge-base sync_base run_commit`` for a three-dot diff.
+
+    Diffing from this commit to ``run_commit`` sees only the card's own
+    history: anything already reachable from ``sync_base`` (the trunk the
+    baseline sync merged) is excluded.
+    """
+
+    probe = run_git(["merge-base", sync_base, run_commit], cwd=workspace, timeout=120)
+    if probe.returncode != 0:
+        error = (probe.stderr or "").strip()
+        raise GitError(f"git merge-base failed: {error or 'unknown error'}")
+    merge_base = probe.stdout.strip()
+    if not merge_base:
+        raise GitError("git merge-base produced no commit")
+    return merge_base
+
+
 def _scope_check(
     *,
     card: CardSpec,
@@ -128,6 +155,7 @@ def _scope_check(
     run_commit: str | None,
     w3_mode: bool,
     scope_base: str | None = None,
+    sync_base: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     ok = True
     detail = "ok"
@@ -138,9 +166,15 @@ def _scope_check(
             if dirty:
                 ok = False
                 detail = "workspace-dirty"
-            changed = diff_paths(
-                scope_base or base_commit, run_commit or "", cwd=workspace
-            )
+            if sync_base:
+                # Three-dot semantics: exclude the trunk the baseline sync
+                # merged in, keep everything the card authored (all rounds).
+                scope_from = _scope_merge_base(
+                    sync_base, run_commit or "", workspace=workspace
+                )
+            else:
+                scope_from = scope_base or base_commit
+            changed = diff_paths(scope_from, run_commit or "", cwd=workspace)
         else:
             # Legacy direct callers (W2 gate test) judge the working tree.
             changed = changed_paths(workspace)
@@ -449,8 +483,8 @@ def run_gate(
     """Run the five fixed checks in order and write ``evidence/gate-report.json``.
 
     ``run_commit`` selects W3 semantics (committed run branch, strict clean
-    workspace, original-base diff).  ``None`` keeps the legacy working-tree
-    behaviour used by direct callers of the W2 API.
+    workspace, three-dot scope diff from ``sync_base``).  ``None`` keeps the
+    legacy working-tree behaviour used by direct callers of the W2 API.
     """
 
     workspace_path = os.path.abspath(os.fspath(workspace))
@@ -482,6 +516,7 @@ def run_gate(
         run_commit=run_commit,
         w3_mode=w3_mode,
         scope_base=scope_base,
+        sync_base=sync_base,
     )
     checks.append(scope)
     round_changed = changed
